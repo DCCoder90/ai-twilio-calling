@@ -161,6 +161,52 @@ Model notes, all learned live in November 2026:
   and an empty reply raises the fallback path with the finish reason
   logged.
 
+## Voice modes: Gather vs ConversationRelay
+
+The conversation above runs in one of two transports, chosen by
+`VOICE_MODE`:
+
+- **`gather` (default)**: the turn-based TwiML flow in the diagram —
+  Twilio transcribes each utterance, POSTs it, waits for TwiML, speaks
+  the reply with its stock `<Say>` voice. Simple and fully auditable;
+  the cadence is walkie-talkie and the voice cannot be interrupted.
+- **`relay`**: the voice webhook returns
+  `<Connect><ConversationRelay>` and the call moves to a WebSocket at
+  `GET /twilio/relay`. Twilio runs the realtime loop — streaming
+  speech-to-text (Deepgram or Google), premium text-to-speech
+  (Amazon Polly, Google, or ElevenLabs voices), turn detection, and
+  **barge-in** — and this service exchanges only text with it: the
+  brief's opening rides as the session's welcome greeting, caller
+  speech arrives as `prompt` messages, replies stream back as text
+  tokens (the model streams too, sentence by sentence, so speech
+  starts on the first sentence), and an `end` message closes the
+  session into the `<Hangup/>` that follows the `<Connect>`.
+
+Everything above the transport is identical in both modes: the same
+brief, the same deterministic rails in front of the model (guarded
+prompts are answered from the brief's lines without a model call), the
+same `max_turns` enforcement, the same transcript and outcome files.
+
+Relay adds one behavior Gather cannot have: **heard-tracking**. When
+the caller barges in, Twilio reports `utteranceUntilInterrupt` — the
+exact text that was spoken before the cut. Generation aborts, and the
+transcript's muse turn for that utterance is rewritten to the heard
+text (or dropped if nothing was heard), so the model's history next
+turn contains only what the caller actually heard. Without this, a
+streaming agent references sentences it never finished and repeats
+itself; with it, an interruption is just a normal conversational
+event.
+
+Costs and limits of relay mode: Twilio charges $0.07/min for
+ConversationRelay on top of normal voice minutes (a 3-minute call is
+roughly a quarter, all-in). The call's audio is processed by Twilio's
+STT/TTS providers — the same disclosure class as a hosted model brain,
+one step further (raw audio, not just transcript text). A caller who
+says nothing produces no prompt, so a silent call idles until Twilio's
+max duration; there is no silence nudge yet. ElevenLabs voices require
+the Twilio account to be enabled for ElevenLabs; the Amazon default
+needs nothing.
+
 ## HTTP routes
 
 | Route | Who calls it | Auth | Purpose |
@@ -169,6 +215,7 @@ Model notes, all learned live in November 2026:
 | `POST /twilio/voice?call_id=<id>` | Twilio | Twilio signature | Opening line + first Gather. |
 | `POST /twilio/gather?call_id=<id>` | Twilio | Twilio signature | One conversation turn per POST (`SpeechResult` form field). |
 | `POST /twilio/status?call_id=<id>` | Twilio | Twilio signature | Status callbacks; logged to the transcript; ends the call record as `party_hangup` when nothing else did. |
+| `GET /twilio/relay` | Twilio | Twilio signature on the WebSocket upgrade | ConversationRelay session (only when `VOICE_MODE=relay`); JSON messages per Twilio's relay protocol. |
 | `POST /briefs` | operator | `X-Ingest-Secret` | Body `{"call_id": "...", "brief": {...}}`. Validates the brief and stores it atomically. 400 invalid, 401 bad secret, 409 spent call_id, 503 when ingest is not configured. |
 | `GET /transcripts/<call_id>` | operator | `X-Ingest-Secret` | `{call_id, turns: [...], outcome: {...}|null}`. 404 when the call is unknown. |
 
@@ -199,6 +246,12 @@ Authentication model:
 | `LLM_API_KEY` | no | — | Bearer key for the gateway (a LiteLLM master key), from a Secret. |
 | `LLM_TIMEOUT_SECONDS` | no | `10` | Per-turn model timeout. Twilio will not wait much longer for TwiML. |
 | `LLM_TEMPERATURE` | no | `0.6` | A float, or `omit` for models that reject the field (Claude 5.x, Opus 4.7). |
+| `VOICE_MODE` | no | `gather` | `gather` = turn-based TwiML (stock `<Say>` voice). `relay` = ConversationRelay streaming (below). |
+| `RELAY_TTS_PROVIDER` | no | `Amazon` | Relay TTS provider: `Amazon`, `Google`, or `ElevenLabs` (ElevenLabs needs account enablement on Twilio's side). |
+| `RELAY_VOICE` | no | `Polly.Matthew-Neural` | Relay voice, in the provider's naming (`Polly.*` for Amazon, `Google.en-US-Neural2-*` style for Google, a voice ID for ElevenLabs). |
+| `RELAY_TRANSCRIPTION_PROVIDER` | no | — (Twilio default) | Relay speech-to-text provider, e.g. `Deepgram` or `Google`. |
+| `RELAY_SPEECH_MODEL` | no | — (provider default) | Relay STT model, e.g. a Deepgram model name. |
+| `RELAY_INTERRUPTIBLE` | no | `any` | Who may barge in on the relay voice: `any`, `speech`, `dtmf`, or `none`. |
 
 ### CLI flags
 
@@ -267,19 +320,24 @@ Twilio uses public DNS).
 Helper CLIs kept with the project (not in this repo):
 `briefs.py create|validate|show` manages local brief files;
 `test_local.py` runs the full local test suites (responder, signature
-verification, LLM mode against a stub gateway, ingest routes) —
-**currently 57 checks, all passing**, no network or credentials needed.
+verification, LLM mode against a stub gateway, ingest routes, and the
+ConversationRelay WebSocket flow against an SSE stub) —
+**currently 72 checks, all passing**, no network or credentials needed.
 
 ## Known limitations / roadmap
 
-- **Voice quality**: replies are spoken with Twilio's stock `<Say>`
-  voice, which is robotic enough to garble its delivery of spelled or
-  digit-heavy text. Upgrades, in order of effort: a premium voice in
-  the `<Say>` tag; per-turn audio generated by a self-hosted TTS
-  (Kokoro-82M) and played with `<Play>`; or Twilio Media Streams.
-- **Turn-based latency**: Twilio transcribes, the model answers, the
-  service speaks. Expect a few seconds per turn. Media Streams is the
-  realtime design and the largest of the roadmap items.
+- **Voice quality**: in `gather` mode replies are spoken with Twilio's
+  stock `<Say>` voice, which is robotic enough to garble its delivery
+  of spelled or digit-heavy text. `relay` mode (above) is the built
+  answer — premium voices, streaming cadence, barge-in. Beyond that,
+  the remaining step up is a fully self-hosted audio path: Twilio
+  Media Streams with a local STT/TTS stack, which trades Twilio's
+  managed loop (and its per-minute fee and provider processing) for a
+  real streaming-audio build.
+- **Turn-based latency (gather mode)**: Twilio transcribes, the model
+  answers, the service speaks. Expect a few seconds per turn. Relay
+  mode streams and answers in about half a second at the median
+  (Twilio's benchmarks).
 - **No voicemail detection yet**: Twilio answering-machine detection
   (`MachineDetection`) is planned; the intent is to hang up on a
   machine verdict rather than leave voicemails.
