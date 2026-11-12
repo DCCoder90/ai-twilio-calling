@@ -1,0 +1,8 @@
+briefs/
+transcripts/
+__pycache__/
+*.log
+.git
+.github
+docker-compose.yml
+README.md
