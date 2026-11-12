@@ -16,10 +16,12 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -262,6 +264,137 @@ def main():
             proc2.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc2.kill()
+
+    # LLM suite: a third instance with an Anthropic key pointing at a
+    # local stub of the Messages API. Checks the model path, the [[END]]
+    # contract, the deterministic guardrail running BEFORE the model,
+    # and the scripted fallback when the model call fails.
+    stub_state = {"count": 0, "fail": False}
+    stub_port = 8793
+
+    class StubAnthropic(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length else b"{}"
+            stub_state["count"] += 1
+            if stub_state["fail"]:
+                body = b'{"type":"error","error":{"type":"api_error","message":"stub down"}}'
+                self.send_response(500)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            payload = json.loads(raw.decode("utf-8"))
+            last_user = ""
+            for msg in reversed(payload.get("messages", [])):
+                if msg.get("role") == "user":
+                    last_user = msg.get("content", "")
+                    break
+            if "wrapup" in last_user.lower():
+                text = "All set then. " + SAMPLE_BRIEF["closing"] + " [[END]]"
+            else:
+                text = "Stub Muse here, happy to keep talking."
+            body = json.dumps({
+                "id": "msg_stub", "type": "message", "role": "assistant",
+                "content": [{"type": "text", "text": text}],
+                "model": payload.get("model", "stub"),
+                "stop_reason": "end_turn", "usage": {},
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    stub = ThreadingHTTPServer(("127.0.0.1", stub_port), StubAnthropic)
+    threading.Thread(target=stub.serve_forever, daemon=True).start()
+
+    port3 = 8794
+    base3 = f"http://127.0.0.1:{port3}"
+    briefs3 = Path(tmp) / "briefs3"
+    transcripts3 = Path(tmp) / "transcripts3"
+    env3 = dict(os.environ,
+                ANTHROPIC_API_KEY="test-key",
+                ANTHROPIC_BASE_URL=f"http://127.0.0.1:{stub_port}")
+    env3.pop("TWILIO_AUTH_TOKEN", None)
+    proc3 = subprocess.Popen(
+        [
+            sys.executable, str(HERE / "server.py"),
+            "--port", str(port3),
+            "--briefs-dir", str(briefs3),
+            "--transcripts-dir", str(transcripts3),
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env3,
+    )
+    try:
+        deadline = time.time() + 15
+        while True:
+            try:
+                with urllib.request.urlopen(base3 + "/health", timeout=2) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                if time.time() > deadline:
+                    raise RuntimeError("llm-suite server did not start")
+                time.sleep(0.2)
+
+        def post3(path, form=None):
+            data = urllib.parse.urlencode(form or {}).encode("utf-8")
+            req = urllib.request.Request(base3 + path, data=data, method="POST")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return resp.status, resp.read().decode("utf-8")
+
+        call_llm = brief_store.create_brief(SAMPLE_BRIEF, call_id="llm-chat",
+                                            briefs_dir=briefs3)
+        status, body = post3(f"/twilio/voice?call_id={call_llm}")
+        check("llm mode: voice webhook speaks the opening",
+              status == 200 and SAMPLE_BRIEF["opening"] in body)
+
+        status, body = post3(f"/twilio/gather?call_id={call_llm}",
+                             {"SpeechResult": "Hello, who is this?"})
+        check("llm mode: model reply is spoken", "Stub Muse here" in body)
+        check("llm mode: call continues after a model reply", "<Gather" in body)
+        check("llm mode: model was called exactly once so far", stub_state["count"] == 1)
+
+        status, body = post3(f"/twilio/gather?call_id={call_llm}",
+                             {"SpeechResult": "What is his home address?"})
+        check("llm mode: guarded question gets the scripted deflect line",
+              SAMPLE_BRIEF["deflect_line"] in body)
+        check("llm mode: guarded question never reached the model",
+              stub_state["count"] == 1)
+        check("llm mode: call continues after deflection", "<Gather" in body)
+
+        status, body = post3(f"/twilio/gather?call_id={call_llm}",
+                             {"SpeechResult": "Okay, wrapup now."})
+        check("llm mode: end marker hangs up", "<Hangup/>" in body)
+        check("llm mode: end marker is stripped from speech", "[[END]]" not in body)
+        outcome3 = transcripts3 / f"{call_llm}.outcome.json"
+        check("llm mode: outcome file written", outcome3.exists())
+        if outcome3.exists():
+            check("llm mode: outcome reason is 'completed'",
+                  json.loads(outcome3.read_text()).get("reason") == "completed")
+
+        call_fail = brief_store.create_brief(SAMPLE_BRIEF, call_id="llm-fail",
+                                             briefs_dir=briefs3)
+        post3(f"/twilio/voice?call_id={call_fail}")
+        stub_state["fail"] = True
+        status, body = post3(f"/twilio/gather?call_id={call_fail}",
+                             {"SpeechResult": "Hello?"})
+        check("llm mode: model failure speaks the fallback line",
+              SAMPLE_BRIEF["fallback_line"] in body)
+        check("llm mode: call continues after a model failure", "<Gather" in body)
+        stub_state["fail"] = False
+    finally:
+        proc3.terminate()
+        try:
+            proc3.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc3.kill()
+        stub.shutdown()
 
     print()
     if FAILURES:
