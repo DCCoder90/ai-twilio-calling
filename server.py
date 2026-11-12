@@ -10,6 +10,15 @@ calls during a live call:
   POST /briefs                      ingest one approved brief (JSON)
   GET  /transcripts/<call_id>       read a call's transcript + outcome
 
+Voice modes: the default "gather" mode above is turn-based TwiML. With
+VOICE_MODE=relay the voice webhook instead hands the call to Twilio
+ConversationRelay (<Connect><ConversationRelay>) and the conversation
+runs over a WebSocket at GET /twilio/relay: Twilio does streaming
+speech-to-text and premium text-to-speech with native barge-in, this
+server exchanges text with it, and the same briefs, deterministic
+rails, transcripts, and outcomes apply. See RelaySession below and the
+README's ConversationRelay section.
+
 The /briefs and /transcripts routes are how Muse operates the system
 hands-free: Ernest approves a call in chat, Muse posts the brief, dials,
 and later fetches the transcript to report the outcome. Both routes
@@ -36,7 +45,11 @@ import hashlib
 import hmac
 import json
 import os
+import socket
+import struct
 import sys
+import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -85,6 +98,103 @@ def twilio_signature(auth_token, url, form):
     data = url + "".join(f"{name}{form[name]}" for name in sorted(form))
     mac = hmac.new(auth_token.encode("utf-8"), data.encode("utf-8"), hashlib.sha1)
     return base64.b64encode(mac.digest()).decode("ascii")
+
+
+# --- WebSocket plumbing (ConversationRelay) ---------------------------
+# Hand-rolled RFC 6455, just enough for ConversationRelay's JSON text
+# messages: the project rule is standard library only, and a relay
+# session is one text message at a time in each direction.
+
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+
+def ws_accept_key(key):
+    digest = hashlib.sha1((key + WS_GUID).encode("ascii")).digest()
+    return base64.b64encode(digest).decode("ascii")
+
+
+def ws_encode_frame(payload, opcode=0x1):
+    data = payload.encode("utf-8") if isinstance(payload, str) else payload
+    head = bytearray([0x80 | opcode])
+    n = len(data)
+    if n < 126:
+        head.append(n)
+    elif n <= 0xFFFF:
+        head.append(126)
+        head += struct.pack(">H", n)
+    else:
+        head.append(127)
+        head += struct.pack(">Q", n)
+    return bytes(head) + data
+
+
+def ws_read_frame(rfile):
+    """Read one WebSocket frame; returns (fin, opcode, payload bytes).
+    Raises ConnectionError when the stream ends or is malformed."""
+    raw = rfile.read(2)
+    if len(raw) < 2:
+        raise ConnectionError("websocket closed")
+    fin = bool(raw[0] & 0x80)
+    opcode = raw[0] & 0x0F
+    masked = bool(raw[1] & 0x80)
+    length = raw[1] & 0x7F
+    if length == 126:
+        ext = rfile.read(2)
+        if len(ext) < 2:
+            raise ConnectionError("websocket closed")
+        length = struct.unpack(">H", ext)[0]
+    elif length == 127:
+        ext = rfile.read(8)
+        if len(ext) < 8:
+            raise ConnectionError("websocket closed")
+        length = struct.unpack(">Q", ext)[0]
+    mask = rfile.read(4) if masked else b""
+    if masked and len(mask) < 4:
+        raise ConnectionError("websocket closed")
+    payload = b""
+    while len(payload) < length:
+        chunk = rfile.read(length - len(payload))
+        if not chunk:
+            raise ConnectionError("websocket closed mid-frame")
+        payload += chunk
+    if masked:
+        payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return fin, opcode, payload
+
+
+def relay_twiml(handler, parsed, call_id, brief, relay):
+    """TwiML handing the call to ConversationRelay. The brief's opening
+    becomes the welcome greeting (Twilio speaks it the moment the
+    session connects, before any WebSocket round trip), the call_id
+    rides along as a <Parameter> and arrives in the setup message's
+    customParameters, and a <Hangup/> follows the <Connect> so the call
+    ends when the relay session does."""
+
+    def attr(value):
+        return escape(str(value), {'"': "&quot;"})
+
+    public = urlparse(handler._public_url(parsed))
+    scheme = "wss" if public.scheme == "https" else "ws"
+    ws_url = f"{scheme}://{public.netloc}/twilio/relay"
+    attrs = [
+        f'url="{attr(ws_url)}"',
+        f'ttsProvider="{attr(relay["tts_provider"])}"',
+        f'voice="{attr(relay["voice"])}"',
+        f'interruptible="{attr(relay["interruptible"])}"',
+        'dtmfDetection="true"',
+        f'welcomeGreeting="{attr(brief["opening"])}"',
+        'welcomeGreetingInterruptible="any"',
+    ]
+    if relay.get("transcription_provider"):
+        attrs.append(f'transcriptionProvider="{attr(relay["transcription_provider"])}"')
+    if relay.get("speech_model"):
+        attrs.append(f'speechModel="{attr(relay["speech_model"])}"')
+    body = (
+        f"<Connect><ConversationRelay {' '.join(attrs)}>"
+        f'<Parameter name="call_id" value="{attr(call_id)}"/>'
+        "</ConversationRelay></Connect><Hangup/>"
+    )
+    return twiml_document(body)
 
 
 class CallHandler(BaseHTTPRequestHandler):
@@ -221,6 +331,9 @@ class CallHandler(BaseHTTPRequestHandler):
         if parsed.path == "/health":
             self._send(200, "ok", "text/plain; charset=utf-8")
             return
+        if parsed.path == "/twilio/relay":
+            self._handle_relay(parsed)
+            return
         if parsed.path == "/twilio/voice":
             self._handle_voice(parsed)
             return
@@ -259,8 +372,53 @@ class CallHandler(BaseHTTPRequestHandler):
             call_id, "muse", brief["opening"], "opening",
             transcripts_dir=self.server.transcripts_dir,
         )
+        relay = getattr(self.server, "relay", None)
+        if relay is not None:
+            self._send(200, relay_twiml(self, parsed, call_id, brief, relay))
+            return
         body = say(brief["opening"]) + gather(call_id, brief["listen_prompt"])
         self._send(200, twiml_document(body))
+
+    def _handle_relay(self, parsed):
+        """ConversationRelay WebSocket endpoint. Validates the upgrade
+        (including Twilio's signature over the wss URL when an auth
+        token is configured), answers 101, then runs the session on
+        this handler thread."""
+        if getattr(self.server, "relay", None) is None:
+            self._send(404, "relay mode is not enabled", "text/plain; charset=utf-8")
+            return
+        key = self.headers.get("Sec-WebSocket-Key")
+        if (self.headers.get("Upgrade") or "").lower() != "websocket" or not key:
+            self._send(400, "expected a websocket upgrade", "text/plain; charset=utf-8")
+            return
+        token = getattr(self.server, "auth_token", None)
+        if token:
+            host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host")
+                    or "").split(",")[0].strip()
+            path = parsed.path + (f"?{parsed.query}" if parsed.query else "")
+            provided = self.headers.get("X-Twilio-Signature") or ""
+            candidates = (f"wss://{host}{path}", f"https://{host}{path}")
+            if not any(hmac.compare_digest(provided, twilio_signature(token, url, {}))
+                       for url in candidates):
+                self._send(403, "invalid Twilio signature", "text/plain; charset=utf-8")
+                return
+        else:
+            sys.stderr.write(
+                "warning: TWILIO_AUTH_TOKEN unset; accepting unsigned "
+                "websocket relay connection\n"
+            )
+        accept = ws_accept_key(key)
+        self.close_connection = True
+        self.connection.sendall(
+            (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept}\r\n\r\n"
+            ).encode("ascii")
+        )
+        self.connection.settimeout(1200)
+        RelaySession(self, parsed).run()
 
     def _handle_gather(self, parsed, form):
         call_id = self._call_id(parsed)
@@ -360,6 +518,314 @@ class CallHandler(BaseHTTPRequestHandler):
         self._send(200, "", "text/plain; charset=utf-8")
 
 
+class RelaySession:
+    """One ConversationRelay WebSocket session.
+
+    The reader loop runs on the connection's handler thread. Model
+    generation runs on a worker thread so an interrupt message can be
+    read and acted on while text is still streaming out; the worker
+    checks the cancel flag between sentence chunks. Sends are
+    serialized with a lock. Transcript writes for a reply happen either
+    on the worker (normal completion) or on the reader thread
+    (interrupt fix-up, after the worker has stopped), never both at
+    once; the one soft spot is a status-callback append landing during
+    an interrupt rewrite, which can lose that single status line.
+
+    Heard-tracking: Twilio's interrupt message carries
+    utteranceUntilInterrupt, the exact text the party heard. The
+    transcript's muse turn for the interrupted utterance is rewritten
+    to it (or dropped when nothing was heard), so the history the
+    model sees next turn contains only what was actually said.
+    """
+
+    def __init__(self, handler, parsed):
+        self.server = handler.server
+        self.conn = handler.connection
+        self.rfile = handler.rfile
+        self.query = parse_qs(parsed.query)
+        self.send_lock = threading.Lock()
+        self.call_id = None
+        self.brief = None
+        self.brain = getattr(self.server, "brain", None)
+        self.tdir = self.server.transcripts_dir
+        self.over = False
+        self.outcome_written = False
+        self.end_thread = None
+        self.gen_thread = None
+        self.gen_done = threading.Event()
+        self.gen_done.set()
+        self.cancel = threading.Event()
+        # The opening is already in the transcript (the voice webhook
+        # appended it) and Twilio speaks it as the welcome greeting.
+        self.utterance_appended = True
+        self.partial_prompt = ""
+
+    # --- transport ------------------------------------------------------
+    def _send_obj(self, obj):
+        frame = ws_encode_frame(json.dumps(obj))
+        with self.send_lock:
+            self.conn.sendall(frame)
+
+    def _send_text(self, token, last):
+        self._send_obj({"type": "text", "token": token, "last": last})
+
+    def _close_socket(self):
+        try:
+            self.conn.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            self.conn.close()
+        except OSError:
+            pass
+
+    def _read_message(self):
+        """Assemble one complete text message; None on close."""
+        chunks = []
+        while True:
+            fin, opcode, payload = ws_read_frame(self.rfile)
+            if opcode == 0x8:
+                return None
+            if opcode == 0x9:  # ping -> pong
+                with self.send_lock:
+                    self.conn.sendall(ws_encode_frame(payload, opcode=0xA))
+                continue
+            if opcode == 0xA:
+                continue
+            chunks.append(payload)
+            if fin:
+                return b"".join(chunks).decode("utf-8", "replace")
+
+    def run(self):
+        try:
+            while not self.over:
+                message = self._read_message()
+                if message is None:
+                    break
+                try:
+                    event = json.loads(message)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                etype = event.get("type")
+                if etype == "setup":
+                    self._on_setup(event)
+                elif etype == "prompt":
+                    self._on_prompt(event)
+                elif etype == "interrupt":
+                    self._on_interrupt(event)
+                elif etype == "dtmf":
+                    if self.call_id:
+                        transcripts.append_turn(
+                            self.call_id, "party", f"dtmf: {event.get('digit', '')}",
+                            "dtmf", transcripts_dir=self.tdir)
+                elif etype == "error":
+                    sys.stderr.write(
+                        f"conversationrelay error for {self.call_id}: "
+                        f"{event.get('description')}\n")
+        except (ConnectionError, OSError):
+            pass
+        finally:
+            self.over = True
+            if self.end_thread is not None:
+                # A finish is mid-flight: the end message goes out on a
+                # speaking-time delay so it cannot truncate the closing
+                # line. Wait for it rather than racing it with a close
+                # frame (which Twilio would read as a dropped session).
+                self.end_thread.join(timeout=30)
+            try:
+                with self.send_lock:
+                    self.conn.sendall(ws_encode_frame(b"", opcode=0x8))
+            except OSError:
+                pass
+
+    # --- events ---------------------------------------------------------
+    def _on_setup(self, event):
+        params = event.get("customParameters") or {}
+        call_id = params.get("call_id") or (self.query.get("call_id") or [None])[0]
+        if not call_id or not brief_store.CALL_ID_RE.match(str(call_id)):
+            self._send_obj({"type": "end"})
+            self.over = True
+            return
+        self.call_id = str(call_id)
+        try:
+            self.brief = brief_store.load_brief(self.call_id, self.server.briefs_dir)
+        except brief_store.BriefError:
+            self._send_obj({"type": "end"})
+            self.over = True
+
+    def _on_prompt(self, event):
+        if self.brief is None or self.over:
+            return
+        text = event.get("voicePrompt") or ""
+        if event.get("last") is False:
+            self.partial_prompt += text
+            return
+        speech = (self.partial_prompt + text).strip()
+        self.partial_prompt = ""
+        # A prompt normally arrives only after the previous reply cycle
+        # finished or was interrupted (which already joined the
+        # worker). Join defensively so transcript writes never race.
+        self._join_generation(timeout=5)
+        if self.over:
+            return
+        transcripts.append_turn(self.call_id, "party", speech, "speech",
+                                transcripts_dir=self.tdir)
+        turn_number = transcripts.party_turn_count(self.call_id, self.tdir)
+        guarded_so_far = transcripts.deflect_count(self.call_id, self.tdir)
+        brief = self.brief
+
+        if self.brain is None:
+            self._speak_scripted(
+                responder.respond(brief, speech, turn_number, guarded_so_far))
+            return
+        if responder.is_guarded(speech):
+            if guarded_so_far + 1 >= responder.GUARDED_LIMIT:
+                self._speak_scripted(responder.Reply(
+                    [brief["deflect_line"], brief["closing"]], end=True,
+                    reason="guarded_wall", tag="guarded_end"))
+            else:
+                self._speak_scripted(responder.Reply(
+                    [brief["deflect_line"]], tag="deflect"))
+            return
+        if responder.is_stop_request(speech):
+            self._speak_scripted(responder.Reply(
+                [brief["closing"]], end=True,
+                reason="stop_requested", tag="stop"))
+            return
+        self._start_generation(turn_number)
+
+    def _on_interrupt(self, event):
+        if self.call_id is None or self.brief is None:
+            return
+        heard = event.get("utteranceUntilInterrupt") or ""
+        if not self.gen_done.is_set():
+            self.cancel.set()
+            self.gen_done.wait(timeout=3)
+        if self.utterance_appended:
+            transcripts.rewrite_last_muse_turn(
+                self.call_id, heard or None, transcripts_dir=self.tdir)
+        elif heard:
+            transcripts.append_turn(
+                self.call_id, "muse", heard, "reply", tag="llm_interrupted",
+                transcripts_dir=self.tdir)
+        transcripts.append_turn(
+            self.call_id, "party", f"interrupt (heard: {heard})", "interrupt",
+            transcripts_dir=self.tdir)
+        self.utterance_appended = False
+
+    # --- speaking ---------------------------------------------------------
+    def _speak_scripted(self, reply):
+        """Send a deterministic Reply (rails or the no-brain responder):
+        each part as its own completed text message, in order."""
+        for part in reply.parts:
+            self._send_text(part, last=True)
+            transcripts.append_turn(
+                self.call_id, "muse", part, "reply", tag=reply.tag,
+                transcripts_dir=self.tdir)
+        if reply.parts:
+            self.utterance_appended = True
+        if reply.end:
+            self._finish(reply.reason, reply.parts[-1] if reply.parts else "")
+
+    def _join_generation(self, timeout=None):
+        if self.gen_thread is not None and self.gen_thread.is_alive():
+            self.gen_done.wait(timeout=timeout)
+
+    def _start_generation(self, turn_number):
+        brief = self.brief
+        turns = transcripts.read_turns(self.call_id, transcripts_dir=self.tdir)
+        self.cancel.clear()
+        self.gen_done.clear()
+        self.utterance_appended = False
+        state = {"held": None, "sent_text": ""}
+        started = time.monotonic()
+
+        def on_chunk(chunk):
+            if self.cancel.is_set():
+                raise llm.StreamCancelled()
+            if state["held"] is not None:
+                self._send_text(state["held"], last=False)
+                state["sent_text"] += state["held"]
+            state["held"] = chunk
+
+        def work():
+            try:
+                try:
+                    text, end, cancelled = self.brain.stream_reply(
+                        brief, turns, on_chunk)
+                except llm.LLMError as exc:
+                    sys.stderr.write(
+                        f"llm stream failed for {self.call_id}: {exc}\n")
+                    if self.cancel.is_set():
+                        return
+                    if state["held"] is not None:
+                        self._send_text(state["held"], last=False)
+                        state["sent_text"] += state["held"]
+                        state["held"] = None
+                    self._send_text(brief["fallback_line"], last=True)
+                    full = state["sent_text"] + brief["fallback_line"]
+                    transcripts.append_turn(
+                        self.call_id, "muse", full, "reply", tag="llm_fallback",
+                        transcripts_dir=self.tdir)
+                    self.utterance_appended = True
+                    return
+                if cancelled:
+                    # The interrupt handler finalizes the transcript
+                    # with what the party actually heard.
+                    return
+                if state["held"] is not None:
+                    self._send_text(state["held"], last=True)
+                    state["held"] = None
+                transcripts.append_turn(
+                    self.call_id, "muse", text, "reply", tag="llm",
+                    transcripts_dir=self.tdir)
+                self.utterance_appended = True
+                if end:
+                    self._finish("completed", text,
+                                 elapsed=time.monotonic() - started)
+                elif turn_number >= int(brief["max_turns"]):
+                    self._send_text(brief["closing"], last=True)
+                    transcripts.append_turn(
+                        self.call_id, "muse", brief["closing"], "reply", tag="llm",
+                        transcripts_dir=self.tdir)
+                    self._finish("max_turns", brief["closing"])
+            except Exception as exc:  # socket died mid-send, etc.
+                sys.stderr.write(
+                    f"relay generation failed for {self.call_id}: {exc}\n")
+                self._close_socket()
+            finally:
+                self.gen_done.set()
+
+        self.gen_thread = threading.Thread(target=work, daemon=True)
+        self.gen_thread.start()
+
+    def _finish(self, reason, last_text="", elapsed=0.0):
+        """Record the outcome and end the relay session. The end
+        message is delayed by a speaking-time estimate for the final
+        text (minus time already elapsed since generation started), so
+        it cannot cut off the closing line still playing."""
+        if not self.outcome_written:
+            transcripts.write_outcome(self.call_id, self.brief, reason,
+                                      transcripts_dir=self.tdir)
+            self.outcome_written = True
+        self.over = True
+        delay = min(20.0, max(1.0, 1.0 + 0.075 * len(last_text or "") - elapsed))
+
+        def _end():
+            time.sleep(delay)
+            try:
+                self._send_obj({"type": "end"})
+            except OSError:
+                pass
+            time.sleep(0.5)
+            self._close_socket()
+
+        self.end_thread = threading.Thread(target=_end, daemon=True)
+        self.end_thread.start()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Twilio outbound calling webhook server")
     parser.add_argument("--host", default="127.0.0.1",
@@ -375,13 +841,24 @@ def main():
     server.auth_token = os.environ.get("TWILIO_AUTH_TOKEN") or None
     server.ingest_secret = os.environ.get("BRIEF_INGEST_SECRET") or None
     server.brain = llm.from_env()
+    server.relay = None
+    if (os.environ.get("VOICE_MODE") or "gather").strip().lower() == "relay":
+        server.relay = {
+            "tts_provider": os.environ.get("RELAY_TTS_PROVIDER") or "Amazon",
+            "voice": os.environ.get("RELAY_VOICE") or "Polly.Matthew-Neural",
+            "transcription_provider":
+                os.environ.get("RELAY_TRANSCRIPTION_PROVIDER") or "",
+            "speech_model": os.environ.get("RELAY_SPEECH_MODEL") or "",
+            "interruptible": os.environ.get("RELAY_INTERRUPTIBLE") or "any",
+        }
     server.briefs_dir.mkdir(parents=True, exist_ok=True)
     server.transcripts_dir.mkdir(parents=True, exist_ok=True)
     print(f"twilio-calling server on http://{args.host}:{args.port} "
           f"(briefs={server.briefs_dir}, transcripts={server.transcripts_dir}, "
           f"signature verification: {'on' if server.auth_token else 'OFF - local dev only'}, "
           f"ingest: {'on' if server.ingest_secret else 'off'}, "
-          f"brain: {(server.brain.model + ' @ ' + server.brain.base_url) if server.brain else 'deterministic responder'})")
+          f"brain: {(server.brain.model + ' @ ' + server.brain.base_url) if server.brain else 'deterministic responder'}, "
+          f"voice mode: {('relay (' + server.relay['tts_provider'] + '/' + server.relay['voice'] + ')') if server.relay else 'gather'})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
