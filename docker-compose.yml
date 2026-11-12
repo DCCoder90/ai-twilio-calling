@@ -12,3 +12,15 @@ services:
       # Host folder holding briefs/ (drop approved brief JSON files here)
       # and transcripts/ (call transcripts and outcome files land here).
       - ./data:/data
+    environment:
+      # Fill these in (or export them) before real use. Without
+      # TWILIO_AUTH_TOKEN the server accepts unsigned webhooks
+      # (local-dev mode) and must not be exposed publicly.
+      TWILIO_AUTH_TOKEN: "${TWILIO_AUTH_TOKEN:-}"
+      BRIEF_INGEST_SECRET: "${BRIEF_INGEST_SECRET:-}"
+      LLM_BASE_URL: "${LLM_BASE_URL:-}"
+      LLM_MODEL: "${LLM_MODEL:-gpt-oss:20b}"
+      LLM_API_KEY: "${LLM_API_KEY:-}"
+      VOICE_MODE: "${VOICE_MODE:-gather}"
+      RELAY_TTS_PROVIDER: "${RELAY_TTS_PROVIDER:-Amazon}"
+      RELAY_VOICE: "${RELAY_VOICE:-Polly.Matthew-Neural}"
