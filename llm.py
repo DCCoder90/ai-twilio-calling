@@ -98,7 +98,11 @@ Ending the call:
         """Return (text, end_call). Raises LLMError on any failure."""
         payload = {
             "model": self.model,
-            "max_tokens": 300,
+            # Generous on purpose: reasoning models served through the
+            # gateway can spend part of this budget thinking before any
+            # speakable text exists, and a tight cap intermittently
+            # returns NO text at all (observed live Nov 12, 2026).
+            "max_tokens": 800,
             "temperature": 0.6,
             "messages": self.messages(brief, turns),
         }
@@ -117,14 +121,18 @@ Ending the call:
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise LLMError(f"LLM request failed: {exc}") from exc
         try:
-            text = data["choices"][0]["message"]["content"] or ""
+            choice = data["choices"][0]
+            text = choice["message"]["content"] or ""
+            finish_reason = choice.get("finish_reason")
         except (KeyError, IndexError, TypeError) as exc:
             raise LLMError(f"unexpected LLM response shape: {exc}") from exc
         # Some local reasoning models leak their scratchpad into content;
         # never speak it aloud.
         text = _THINK_BLOCK.sub("", text).strip()
         if not text:
-            raise LLMError("LLM response carried no speakable text")
+            raise LLMError(
+                f"LLM response carried no speakable text (finish_reason={finish_reason})"
+            )
         end = END_MARKER in text
         if end:
             text = text.replace(END_MARKER, "").strip()
