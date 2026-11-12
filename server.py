@@ -7,6 +7,14 @@ calls during a live call:
   POST /twilio/voice?call_id=<id>   opening <Say> + speech <Gather>
   POST /twilio/gather?call_id=<id>  one back-and-forth turn
   POST /twilio/status               call status callbacks (logged)
+  POST /briefs                      ingest one approved brief (JSON)
+  GET  /transcripts/<call_id>       read a call's transcript + outcome
+
+The /briefs and /transcripts routes are how Muse operates the system
+hands-free: Ernest approves a call in chat, Muse posts the brief, dials,
+and later fetches the transcript to report the outcome. Both routes
+require the BRIEF_INGEST_SECRET environment variable, sent as the
+X-Ingest-Secret header; when it is unset both routes refuse with 503.
 
 Run locally with:
   python3 server.py --port 8765        (binds 127.0.0.1 by default)
@@ -26,6 +34,7 @@ import argparse
 import base64
 import hashlib
 import hmac
+import json
 import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -129,6 +138,78 @@ class CallHandler(BaseHTTPRequestHandler):
         except brief_store.BriefError:
             return None, end_twiml("Sorry, this call is not configured. Goodbye.")
 
+    # --- ingest / transcript access ------------------------------------
+    def _check_ingest_auth(self):
+        """True when the request carries the ingest secret. Returns
+        False after sending 503 (feature disabled) or 401 (bad secret)."""
+        secret = getattr(self.server, "ingest_secret", None)
+        if not secret:
+            self._send(503, "ingest disabled: BRIEF_INGEST_SECRET is not set",
+                       "text/plain; charset=utf-8")
+            return False
+        provided = self.headers.get("X-Ingest-Secret") or ""
+        if not hmac.compare_digest(provided, secret):
+            self._send(401, "bad or missing X-Ingest-Secret", "text/plain; charset=utf-8")
+            return False
+        return True
+
+    def _json_body(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        return json.loads(raw)
+
+    def _send_json(self, code, obj):
+        self._send(code, json.dumps(obj), "application/json; charset=utf-8")
+
+    def _handle_ingest(self):
+        if not self._check_ingest_auth():
+            return
+        try:
+            payload = self._json_body()
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            self._send_json(400, {"error": f"request body is not valid JSON: {exc}"})
+            return
+        call_id = payload.get("call_id") if isinstance(payload, dict) else None
+        brief = payload.get("brief") if isinstance(payload, dict) else None
+        if not call_id or not brief_store.CALL_ID_RE.match(str(call_id)):
+            self._send_json(400, {"error": "call_id is required and must match [A-Za-z0-9_-]{1,64}"})
+            return
+        if not isinstance(brief, dict):
+            self._send_json(400, {"error": "brief is required and must be a JSON object"})
+            return
+        # A call_id whose call already happened is spent; its transcript
+        # is the record and a new brief must not resurrect the id.
+        tpath = transcripts.transcript_path(call_id, self.server.transcripts_dir)
+        if tpath.exists():
+            self._send_json(409, {"error": f"call_id {call_id!r} already has a transcript; use a new call_id"})
+            return
+        try:
+            brief_store.save_brief(call_id, brief, self.server.briefs_dir)
+        except brief_store.BriefError as exc:
+            self._send_json(400, {"error": str(exc)})
+            return
+        self._send_json(200, {"call_id": call_id, "stored": True})
+
+    def _handle_transcript_fetch(self, parsed):
+        if not self._check_ingest_auth():
+            return
+        call_id = parsed.path[len("/transcripts/"):]
+        if not brief_store.CALL_ID_RE.match(call_id or ""):
+            self._send_json(400, {"error": "invalid call_id"})
+            return
+        turns = transcripts.read_turns(call_id, self.server.transcripts_dir)
+        outcome = None
+        opath = transcripts.outcome_path(call_id, self.server.transcripts_dir)
+        if opath.exists():
+            try:
+                outcome = json.loads(opath.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                outcome = None
+        if not turns and outcome is None:
+            self._send_json(404, {"error": f"no transcript for call_id {call_id!r}"})
+            return
+        self._send_json(200, {"call_id": call_id, "turns": turns, "outcome": outcome})
+
     # --- routes -------------------------------------------------------
     def do_GET(self):
         parsed = urlparse(self.path)
@@ -138,10 +219,16 @@ class CallHandler(BaseHTTPRequestHandler):
         if parsed.path == "/twilio/voice":
             self._handle_voice(parsed)
             return
+        if parsed.path.startswith("/transcripts/"):
+            self._handle_transcript_fetch(parsed)
+            return
         self._send(404, "not found", "text/plain; charset=utf-8")
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path == "/briefs":
+            self._handle_ingest()
+            return
         if parsed.path not in ("/twilio/voice", "/twilio/gather", "/twilio/status"):
             self._send(404, "not found", "text/plain; charset=utf-8")
             return
@@ -281,12 +368,14 @@ def main():
     server.briefs_dir = Path(args.briefs_dir)
     server.transcripts_dir = Path(args.transcripts_dir)
     server.auth_token = os.environ.get("TWILIO_AUTH_TOKEN") or None
+    server.ingest_secret = os.environ.get("BRIEF_INGEST_SECRET") or None
     server.brain = llm.from_env()
     server.briefs_dir.mkdir(parents=True, exist_ok=True)
     server.transcripts_dir.mkdir(parents=True, exist_ok=True)
     print(f"twilio-calling server on http://{args.host}:{args.port} "
           f"(briefs={server.briefs_dir}, transcripts={server.transcripts_dir}, "
           f"signature verification: {'on' if server.auth_token else 'OFF - local dev only'}, "
+          f"ingest: {'on' if server.ingest_secret else 'off'}, "
           f"brain: {(server.brain.model + ' @ ' + server.brain.base_url) if server.brain else 'deterministic responder'})")
     try:
         server.serve_forever()
