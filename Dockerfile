@@ -3,7 +3,7 @@
 FROM python:3.12-slim
 
 WORKDIR /app
-COPY server.py responder.py briefs.py transcripts.py ./
+COPY server.py responder.py briefs.py transcripts.py llm.py ./
 
 # Briefs (input) and transcripts (output) live on a mounted volume so the
 # code image stays stateless.
