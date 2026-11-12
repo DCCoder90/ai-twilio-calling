@@ -176,10 +176,18 @@ def relay_twiml(handler, parsed, call_id, brief, relay):
     public = urlparse(handler._public_url(parsed))
     scheme = "wss" if public.scheme == "https" else "ws"
     ws_url = f"{scheme}://{public.netloc}/twilio/relay"
+    # ConversationRelay takes the BARE voice name (e.g. "Matthew-Neural"
+    # for Amazon), unlike <Say>'s "Polly.Matthew-Neural". The prefixed
+    # form is accepted at session setup but every synthesis then fails
+    # and the caller hears silence (verified live Nov 12, 2026), so
+    # normalize the common mistake away.
+    voice = str(relay["voice"])
+    if relay["tts_provider"] == "Amazon" and voice.startswith("Polly."):
+        voice = voice[len("Polly."):]
     attrs = [
         f'url="{attr(ws_url)}"',
         f'ttsProvider="{attr(relay["tts_provider"])}"',
-        f'voice="{attr(relay["voice"])}"',
+        f'voice="{attr(voice)}"',
         f'interruptible="{attr(relay["interruptible"])}"',
         'dtmfDetection="true"',
         f'welcomeGreeting="{attr(brief["opening"])}"',
@@ -845,7 +853,7 @@ def main():
     if (os.environ.get("VOICE_MODE") or "gather").strip().lower() == "relay":
         server.relay = {
             "tts_provider": os.environ.get("RELAY_TTS_PROVIDER") or "Amazon",
-            "voice": os.environ.get("RELAY_VOICE") or "Polly.Matthew-Neural",
+            "voice": os.environ.get("RELAY_VOICE") or "Matthew-Neural",
             "transcription_provider":
                 os.environ.get("RELAY_TRANSCRIPTION_PROVIDER") or "",
             "speech_model": os.environ.get("RELAY_SPEECH_MODEL") or "",
