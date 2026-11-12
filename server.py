@@ -35,6 +35,7 @@ from xml.sax.saxutils import escape
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import briefs as brief_store
+import llm
 import responder
 import transcripts
 
@@ -182,7 +183,7 @@ class CallHandler(BaseHTTPRequestHandler):
         guarded_so_far = transcripts.deflect_count(call_id, tdir)
         transcripts.append_turn(call_id, "party", speech, "speech", transcripts_dir=tdir)
 
-        reply = responder.respond(brief, speech, turn_number, guarded_so_far)
+        reply = self._decide(brief, speech, turn_number, guarded_so_far, call_id, tdir)
         for part in reply.parts:
             transcripts.append_turn(
                 call_id, "muse", part, "reply", tag=reply.tag, transcripts_dir=tdir
@@ -193,6 +194,43 @@ class CallHandler(BaseHTTPRequestHandler):
             self._send(200, end_twiml(reply.parts))
         else:
             self._send(200, continue_twiml(call_id, brief, reply.parts))
+
+    def _decide(self, brief, speech, turn_number, guarded_so_far, call_id, tdir):
+        """Choose the reply for one party utterance.
+
+        Without an LLM brain configured, the deterministic responder
+        decides everything. With one, the deterministic rails still run
+        first (guarded topics deflect by rule and never reach the model;
+        stop requests end by rule), then the model converses, and any
+        model failure falls back to the brief's scripted fallback line.
+        """
+        brain = getattr(self.server, "brain", None)
+        if brain is None:
+            return responder.respond(brief, speech, turn_number, guarded_so_far)
+
+        deflect = brief["deflect_line"]
+        closing = brief["closing"]
+        if responder.is_guarded(speech):
+            if guarded_so_far + 1 >= responder.GUARDED_LIMIT:
+                return responder.Reply([deflect, closing], end=True,
+                                       reason="guarded_wall", tag="guarded_end")
+            return responder.Reply([deflect], tag="deflect")
+        if responder.is_stop_request(speech):
+            return responder.Reply([closing], end=True,
+                                   reason="stop_requested", tag="stop")
+
+        turns = transcripts.read_turns(call_id, transcripts_dir=tdir)
+        try:
+            text, end = brain.reply(brief, turns)
+            reply = responder.Reply([text], end=end,
+                                    reason="completed" if end else None, tag="llm")
+        except llm.LLMError as exc:
+            sys.stderr.write(f"llm brain failed for {call_id}: {exc}\n")
+            reply = responder.Reply([brief["fallback_line"]], tag="llm_fallback")
+        if not reply.end and turn_number >= int(brief["max_turns"]):
+            reply = responder.Reply(reply.parts + [closing], end=True,
+                                    reason="max_turns", tag=reply.tag)
+        return reply
 
     def _handle_status(self, parsed, form):
         call_id = self._call_id(parsed)
@@ -243,11 +281,13 @@ def main():
     server.briefs_dir = Path(args.briefs_dir)
     server.transcripts_dir = Path(args.transcripts_dir)
     server.auth_token = os.environ.get("TWILIO_AUTH_TOKEN") or None
+    server.brain = llm.from_env()
     server.briefs_dir.mkdir(parents=True, exist_ok=True)
     server.transcripts_dir.mkdir(parents=True, exist_ok=True)
     print(f"twilio-calling server on http://{args.host}:{args.port} "
           f"(briefs={server.briefs_dir}, transcripts={server.transcripts_dir}, "
-          f"signature verification: {'on' if server.auth_token else 'OFF - local dev only'})")
+          f"signature verification: {'on' if server.auth_token else 'OFF - local dev only'}, "
+          f"brain: {('anthropic ' + server.brain.model) if server.brain else 'deterministic responder'})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
