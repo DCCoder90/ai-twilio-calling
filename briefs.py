@@ -13,6 +13,7 @@ CLI:
 """
 import argparse
 import json
+import os
 import re
 import sys
 import uuid
@@ -118,6 +119,24 @@ def create_brief(spec, call_id=None, briefs_dir=DEFAULT_BRIEFS_DIR):
     if path.exists():
         raise BriefError(f"brief already exists for call_id {call_id!r}: {path}")
     path.write_text(json.dumps(normalize_brief(spec), indent=2) + "\n", encoding="utf-8")
+    return call_id
+
+
+def save_brief(call_id, spec, briefs_dir=DEFAULT_BRIEFS_DIR):
+    """Validate a brief spec and store it under call_id, replacing any
+    existing brief. Used by the ingest endpoint, where Muse delivers a
+    brief the moment Ernest approves a call. The write is atomic (temp
+    file in the same directory, then rename), so a webhook request can
+    never read a half-written brief. Raises BriefError on any problem.
+    """
+    errors = validate_brief(spec)
+    if errors:
+        raise BriefError("invalid brief spec: " + "; ".join(errors))
+    path = brief_path(call_id, briefs_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{call_id}.tmp-{os.getpid()}")
+    tmp.write_text(json.dumps(normalize_brief(spec), indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
     return call_id
 
 
