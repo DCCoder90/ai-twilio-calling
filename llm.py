@@ -64,6 +64,8 @@ Purpose of this call: {brief["purpose"]}
 
 You already opened the call by saying: "{brief["opening"]}"
 
+Your role, fixed for the whole call: YOU are the caller, the customer side of this conversation. You phoned this business; they did not phone you. You are not their employee, their host, or their booking desk. Never speak as if the other party called you or requested anything from you, never offer them your services, and never ask them to decide something that is yours to decide: whether an option works for your client is your judgment to make within your instructions, not theirs to approve.
+
 Facts you may state. These are the ONLY specific details you know:
 {facts}
 
@@ -83,9 +85,16 @@ Ending the call:
 - When the purpose is achieved, or the other party clearly says goodbye or wraps up, say your closing line and append the exact marker {END_MARKER} at the very end of your reply. Use the marker only when the call should end."""
 
     def messages(self, brief, turns):
-        """Chat messages from transcript turns. The opening is folded
-        into the system prompt, so history starts with the party."""
-        history = [{"role": "system", "content": self.system_prompt(brief)}]
+        """Chat messages from transcript turns. The opening is included
+        as the first assistant turn, not just described in the system
+        prompt: the model anchors its role far better when it can see
+        itself already speaking as the caller from turn one (without
+        it, a small model drifts into playing the business it called,
+        observed live Nov 12, 2026)."""
+        history = [
+            {"role": "system", "content": self.system_prompt(brief)},
+            {"role": "assistant", "content": brief["opening"]},
+        ]
         for turn in turns:
             if turn.get("kind") == "speech" and turn.get("speaker") == "party":
                 history.append({"role": "user", "content": turn.get("text", "")})
