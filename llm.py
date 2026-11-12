@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 """LLM conversation brain for the Twilio outbound calling system.
 
-When an Anthropic API key is configured, this module is what actually
-talks: per speech turn it sends the call brief (as a system prompt) and
-the conversation so far to the Anthropic Messages API and returns what
-Muse says next. Python standard library only.
+When an OpenAI-compatible chat endpoint is configured, this module is
+what actually talks: per speech turn it sends the call brief (as the
+system prompt) and the conversation so far to the endpoint and returns
+what the model says next. In Ernest's deployment the endpoint is his
+LiteLLM gateway, so the model behind a call is swappable with one
+environment variable (local models on the Spark today, a hosted model
+tomorrow) and nothing about a call leaves his network unless his
+LiteLLM routes it out. Python standard library only.
 
 Safety shape (see server.py): the deterministic rails run BEFORE this
 module is consulted. Guarded personal questions are deflected by rule
@@ -17,21 +21,25 @@ exact marker [[END]] when the call's purpose is achieved or the other
 party wraps up. The server strips the marker and hangs up.
 
 Configuration (environment):
-  ANTHROPIC_API_KEY   required to enable this brain at all
-  ANTHROPIC_MODEL     default claude-haiku-4-5 (fast tier; phone turns
-                      are short and latency matters more than depth)
-  ANTHROPIC_BASE_URL  default https://api.anthropic.com
+  LLM_BASE_URL        required to enable this brain at all, e.g.
+                      http://litellm:4000 (the gateway's /chat/completions
+                      is appended)
+  LLM_MODEL           default gpt-oss:20b (fast tier on the Spark; phone
+                      turns are short and latency matters)
+  LLM_API_KEY         optional bearer key (LiteLLM master key, when the
+                      gateway requires one)
   LLM_TIMEOUT_SECONDS default 10 (Twilio will not wait long for TwiML)
 """
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
 END_MARKER = "[[END]]"
-DEFAULT_MODEL = "claude-haiku-4-5"
-DEFAULT_BASE_URL = "https://api.anthropic.com"
-API_VERSION = "2023-06-01"
+DEFAULT_MODEL = "gpt-oss:20b"
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
 class LLMError(Exception):
@@ -39,11 +47,10 @@ class LLMError(Exception):
 
 
 class LLMBrain:
-    def __init__(self, api_key, model=DEFAULT_MODEL, base_url=DEFAULT_BASE_URL,
-                 timeout=10):
-        self.api_key = api_key
-        self.model = model
+    def __init__(self, base_url, model=DEFAULT_MODEL, api_key=None, timeout=10):
         self.base_url = base_url.rstrip("/")
+        self.model = model
+        self.api_key = api_key
         self.timeout = timeout
 
     # --- prompt construction ------------------------------------------
@@ -74,15 +81,15 @@ Ending the call:
 - When the purpose is achieved, or the other party clearly says goodbye or wraps up, say your closing line and append the exact marker {END_MARKER} at the very end of your reply. Use the marker only when the call should end."""
 
     def messages(self, brief, turns):
-        """Anthropic messages from transcript turns. The opening is folded
+        """Chat messages from transcript turns. The opening is folded
         into the system prompt, so history starts with the party."""
-        history = []
+        history = [{"role": "system", "content": self.system_prompt(brief)}]
         for turn in turns:
             if turn.get("kind") == "speech" and turn.get("speaker") == "party":
                 history.append({"role": "user", "content": turn.get("text", "")})
             elif turn.get("kind") == "reply" and turn.get("speaker") == "muse":
                 history.append({"role": "assistant", "content": turn.get("text", "")})
-        if not history or history[-1]["role"] != "user":
+        if len(history) < 2 or history[-1]["role"] != "user":
             raise LLMError("conversation history does not end with a party utterance")
         return history
 
@@ -92,31 +99,32 @@ Ending the call:
         payload = {
             "model": self.model,
             "max_tokens": 300,
-            "system": self.system_prompt(brief),
+            "temperature": 0.6,
             "messages": self.messages(brief, turns),
         }
+        headers = {"content-type": "application/json"}
+        if self.api_key:
+            headers["authorization"] = f"Bearer {self.api_key}"
         request = urllib.request.Request(
-            f"{self.base_url}/v1/messages",
+            f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
-            headers={
-                "content-type": "application/json",
-                "x-api-key": self.api_key,
-                "anthropic-version": API_VERSION,
-            },
+            headers=headers,
         )
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise LLMError(f"Anthropic request failed: {exc}") from exc
-        text = "".join(
-            block.get("text", "")
-            for block in data.get("content", [])
-            if block.get("type") == "text"
-        ).strip()
+            raise LLMError(f"LLM request failed: {exc}") from exc
+        try:
+            text = data["choices"][0]["message"]["content"] or ""
+        except (KeyError, IndexError, TypeError) as exc:
+            raise LLMError(f"unexpected LLM response shape: {exc}") from exc
+        # Some local reasoning models leak their scratchpad into content;
+        # never speak it aloud.
+        text = _THINK_BLOCK.sub("", text).strip()
         if not text:
-            raise LLMError("Anthropic response carried no text")
+            raise LLMError("LLM response carried no speakable text")
         end = END_MARKER in text
         if end:
             text = text.replace(END_MARKER, "").strip()
@@ -126,19 +134,19 @@ Ending the call:
 
 
 def from_env(env=None):
-    """Build an LLMBrain from the environment, or None when no API key is
-    configured (the server then uses the deterministic responder)."""
+    """Build an LLMBrain from the environment, or None when no endpoint
+    is configured (the server then uses the deterministic responder)."""
     env = os.environ if env is None else env
-    api_key = env.get("ANTHROPIC_API_KEY") or None
-    if not api_key:
+    base_url = env.get("LLM_BASE_URL") or None
+    if not base_url:
         return None
     try:
         timeout = int(env.get("LLM_TIMEOUT_SECONDS", "10"))
     except ValueError:
         timeout = 10
     return LLMBrain(
-        api_key=api_key,
-        model=env.get("ANTHROPIC_MODEL") or DEFAULT_MODEL,
-        base_url=env.get("ANTHROPIC_BASE_URL") or DEFAULT_BASE_URL,
+        base_url=base_url,
+        model=env.get("LLM_MODEL") or DEFAULT_MODEL,
+        api_key=env.get("LLM_API_KEY") or None,
         timeout=timeout,
     )
