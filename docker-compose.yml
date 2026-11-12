@@ -23,4 +23,4 @@ services:
       LLM_API_KEY: "${LLM_API_KEY:-}"
       VOICE_MODE: "${VOICE_MODE:-gather}"
       RELAY_TTS_PROVIDER: "${RELAY_TTS_PROVIDER:-Amazon}"
-      RELAY_VOICE: "${RELAY_VOICE:-Polly.Matthew-Neural}"
+      RELAY_VOICE: "${RELAY_VOICE:-Matthew-Neural}"
