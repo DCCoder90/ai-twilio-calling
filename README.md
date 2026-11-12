@@ -33,6 +33,26 @@ The container serves on port 8765 (the image binds `0.0.0.0`; a bare
 - `POST /twilio/gather?call_id=<id>` — each speech turn posts here.
 - `POST /twilio/status?call_id=<id>` — Twilio status callbacks.
 
+## Conversation brain
+
+Two modes, chosen by environment at startup:
+
+- **Deterministic responder** (default, no API key): replies come from
+  the brief alone, keyword matching against prewritten answers. Fully
+  auditable, limited conversation.
+- **Muse (Anthropic API)**: set `ANTHROPIC_API_KEY` (a Secret; never in
+  a manifest) and each turn is a real conversation with Muse, briefed
+  by the system prompt built from the brief. `ANTHROPIC_MODEL` defaults
+  to `claude-haiku-4-5`; `ANTHROPIC_BASE_URL` and `LLM_TIMEOUT_SECONDS`
+  (default 10) are also overridable.
+
+In Muse mode the deterministic rails still run first: guarded personal
+questions are deflected by rule and never reach the model, stop requests
+end the call by rule, the server enforces `max_turns`, and a model
+timeout or error speaks the brief's fallback line instead of dead air.
+The model ends the call by appending `[[END]]` after its closing line;
+the server strips the marker and hangs up.
+
 ## Request authentication (required in production)
 
 Set the environment variable `TWILIO_AUTH_TOKEN` to the account's Auth
