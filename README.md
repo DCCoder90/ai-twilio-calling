@@ -25,12 +25,22 @@ docker compose up -d
 The image is `ghcr.io/dccoder90/ai-twilio-calling:latest`, built by the
 GitHub Actions workflow in this repo on every push to `main`.
 
-The container serves on port 8765:
+The container serves on port 8765 (the image binds `0.0.0.0`; a bare
+`server.py` run binds `127.0.0.1` unless `--host` says otherwise):
 
 - `GET /health` — liveness.
 - `POST /twilio/voice?call_id=<id>` — Twilio fetches the opening TwiML here.
 - `POST /twilio/gather?call_id=<id>` — each speech turn posts here.
 - `POST /twilio/status?call_id=<id>` — Twilio status callbacks.
+
+## Request authentication (required in production)
+
+Set the environment variable `TWILIO_AUTH_TOKEN` to the account's Auth
+Token (in Kubernetes: from a Secret, never in a manifest). With it set,
+every POST to `/twilio/*` must carry a valid `X-Twilio-Signature` header
+or the server answers 403. Without it the server runs in local-dev mode,
+accepts unsigned requests, and logs a warning per request. Do not expose
+a deployment without the token set.
 
 ## Public HTTPS is your side of the fence
 
