@@ -769,6 +769,8 @@ def main():
         check("relay mode: no Gather loop in relay TwiML", "<Gather" not in body)
         check("relay mode: voice is the bare ConversationRelay name (no Polly. prefix)",
               'voice="Joanna-Generative"' in body and "Polly." not in body)
+        check("relay mode: interrupt sensitivity defaults to medium (Twilio default is high)",
+              'interruptSensitivity="medium"' in body)
 
         ws = WSClient(port5, "/twilio/relay")
         check("relay websocket handshake is 101", "101" in ws.status_line)
