@@ -853,7 +853,7 @@ def main():
     if (os.environ.get("VOICE_MODE") or "gather").strip().lower() == "relay":
         server.relay = {
             "tts_provider": os.environ.get("RELAY_TTS_PROVIDER") or "Amazon",
-            "voice": os.environ.get("RELAY_VOICE") or "Matthew-Neural",
+            "voice": os.environ.get("RELAY_VOICE") or "Joanna-Generative",
             "transcription_provider":
                 os.environ.get("RELAY_TRANSCRIPTION_PROVIDER") or "",
             "speech_model": os.environ.get("RELAY_SPEECH_MODEL") or "",
