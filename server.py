@@ -9,14 +9,24 @@ calls during a live call:
   POST /twilio/status               call status callbacks (logged)
 
 Run locally with:
-  python3 server.py --port 8765        (binds 127.0.0.1 only)
+  python3 server.py --port 8765        (binds 127.0.0.1 by default)
+  python3 server.py --host 0.0.0.0     (container/pod: accept non-loopback)
 
 Twilio needs a public HTTPS base URL in front of this server before any
-real call; that tunnel decision is Ernest's and is NOT set up here. All
-conversation behavior is deterministic (see responder.py) and driven by
-the per-call brief in briefs/<call_id>.json (see briefs.py).
+real call. All conversation behavior is deterministic (see responder.py)
+and driven by the per-call brief in briefs/<call_id>.json (see briefs.py).
+
+Request authentication: when the TWILIO_AUTH_TOKEN environment variable
+is set, every POST to /twilio/* must carry a valid X-Twilio-Signature
+header or it is rejected with 403. When the variable is unset (local
+development), requests are accepted and a warning is logged per request;
+never run a public deployment without it.
 """
 import argparse
+import base64
+import hashlib
+import hmac
+import os
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -54,6 +64,14 @@ def end_twiml(parts):
     return twiml_document("".join(say(p) for p in parts) + "<Hangup/>")
 
 
+def twilio_signature(auth_token, url, form):
+    """Twilio's request signature: base64(HMAC-SHA1(token, url + sorted
+    name/value pairs of the POST body concatenated without separators))."""
+    data = url + "".join(f"{name}{form[name]}" for name in sorted(form))
+    mac = hmac.new(auth_token.encode("utf-8"), data.encode("utf-8"), hashlib.sha1)
+    return base64.b64encode(mac.digest()).decode("ascii")
+
+
 class CallHandler(BaseHTTPRequestHandler):
     server_version = "TwilioCalling/0.1"
 
@@ -79,6 +97,29 @@ class CallHandler(BaseHTTPRequestHandler):
         values = params.get("call_id")
         return values[0] if values else None
 
+    def _public_url(self, parsed):
+        """The URL Twilio requested, reconstructed behind proxies: Twilio
+        signs the public URL, so prefer X-Forwarded-Proto / -Host when a
+        reverse proxy or ingress supplies them."""
+        proto = (self.headers.get("X-Forwarded-Proto") or "http").split(",")[0].strip()
+        host = (self.headers.get("X-Forwarded-Host") or self.headers.get("Host") or "").split(",")[0].strip()
+        url = f"{proto}://{host}{parsed.path}"
+        if parsed.query:
+            url += f"?{parsed.query}"
+        return url
+
+    def _verify_twilio(self, parsed, form):
+        token = getattr(self.server, "auth_token", None)
+        if not token:
+            sys.stderr.write(
+                "warning: TWILIO_AUTH_TOKEN unset; accepting unsigned "
+                f"request to {parsed.path}\n"
+            )
+            return True
+        provided = self.headers.get("X-Twilio-Signature") or ""
+        expected = twilio_signature(token, self._public_url(parsed), form)
+        return hmac.compare_digest(provided, expected)
+
     def _load_brief_or_error(self, call_id):
         if not call_id:
             return None, end_twiml("Sorry, this call is not configured. Goodbye.")
@@ -100,15 +141,19 @@ class CallHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         parsed = urlparse(self.path)
+        if parsed.path not in ("/twilio/voice", "/twilio/gather", "/twilio/status"):
+            self._send(404, "not found", "text/plain; charset=utf-8")
+            return
+        form = self._form()
+        if not self._verify_twilio(parsed, form):
+            self._send(403, "invalid Twilio signature", "text/plain; charset=utf-8")
+            return
         if parsed.path == "/twilio/voice":
-            self._form()  # consume body if any
             self._handle_voice(parsed)
         elif parsed.path == "/twilio/gather":
-            self._handle_gather(parsed)
-        elif parsed.path == "/twilio/status":
-            self._handle_status(parsed)
+            self._handle_gather(parsed, form)
         else:
-            self._send(404, "not found", "text/plain; charset=utf-8")
+            self._handle_status(parsed, form)
 
     # --- handlers -----------------------------------------------------
     def _handle_voice(self, parsed):
@@ -124,13 +169,12 @@ class CallHandler(BaseHTTPRequestHandler):
         body = say(brief["opening"]) + gather(call_id, brief["listen_prompt"])
         self._send(200, twiml_document(body))
 
-    def _handle_gather(self, parsed):
+    def _handle_gather(self, parsed, form):
         call_id = self._call_id(parsed)
         brief, error = self._load_brief_or_error(call_id)
         if brief is None:
             self._send(200, error)
             return
-        form = self._form()
         speech = form.get("SpeechResult", "") or ""
         tdir = self.server.transcripts_dir
 
@@ -150,12 +194,19 @@ class CallHandler(BaseHTTPRequestHandler):
         else:
             self._send(200, continue_twiml(call_id, brief, reply.parts))
 
-    def _handle_status(self, parsed):
-        form = self._form()
+    def _handle_status(self, parsed, form):
         call_id = self._call_id(parsed)
         call_sid = form.get("CallSid", "")
         status = form.get("CallStatus", "")
+        # call_id names files on disk via the transcript store; never let
+        # an unchecked value reach a path. Brief ids are validated the
+        # same way in briefs.py.
+        if call_id and not brief_store.CALL_ID_RE.match(call_id):
+            self._send(400, "invalid call_id", "text/plain; charset=utf-8")
+            return
         log_id = call_id or call_sid or "unknown"
+        if not brief_store.CALL_ID_RE.match(log_id):
+            log_id = "unknown"
         transcripts.append_turn(
             log_id, "party",
             f"status callback: CallSid={call_sid} CallStatus={status} "
@@ -181,18 +232,22 @@ class CallHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description="Twilio outbound calling webhook server")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="bind address (default 127.0.0.1; use 0.0.0.0 in a container/pod)")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--briefs-dir", default=str(brief_store.DEFAULT_BRIEFS_DIR))
     parser.add_argument("--transcripts-dir", default=str(transcripts.DEFAULT_TRANSCRIPTS_DIR))
     args = parser.parse_args()
 
-    server = ThreadingHTTPServer(("127.0.0.1", args.port), CallHandler)
+    server = ThreadingHTTPServer((args.host, args.port), CallHandler)
     server.briefs_dir = Path(args.briefs_dir)
     server.transcripts_dir = Path(args.transcripts_dir)
+    server.auth_token = os.environ.get("TWILIO_AUTH_TOKEN") or None
     server.briefs_dir.mkdir(parents=True, exist_ok=True)
     server.transcripts_dir.mkdir(parents=True, exist_ok=True)
-    print(f"twilio-calling server on http://127.0.0.1:{args.port} "
-          f"(briefs={server.briefs_dir}, transcripts={server.transcripts_dir})")
+    print(f"twilio-calling server on http://{args.host}:{args.port} "
+          f"(briefs={server.briefs_dir}, transcripts={server.transcripts_dir}, "
+          f"signature verification: {'on' if server.auth_token else 'OFF - local dev only'})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
