@@ -67,7 +67,14 @@ def read_turns(call_id, transcripts_dir=DEFAULT_TRANSCRIPTS_DIR):
 
 
 def party_turn_count(call_id, transcripts_dir=DEFAULT_TRANSCRIPTS_DIR):
-    return sum(1 for t in read_turns(call_id, transcripts_dir) if t.get("speaker") == "party")
+    """Count the party's SPEECH turns. Status callbacks are also logged
+    with speaker 'party' but are not conversation turns; counting them
+    would burn the call's max_turns budget on carrier events."""
+    return sum(
+        1
+        for t in read_turns(call_id, transcripts_dir)
+        if t.get("speaker") == "party" and t.get("kind") == "speech"
+    )
 
 
 def deflect_count(call_id, transcripts_dir=DEFAULT_TRANSCRIPTS_DIR):
