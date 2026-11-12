@@ -147,6 +147,20 @@ def _match_fact(brief, normalized_text):
     return best
 
 
+def is_guarded(speech):
+    """True when the utterance asks for a guarded personal detail.
+    Used by the server as a hard pre-filter in front of the LLM brain:
+    guarded questions are deflected by rule and never reach the model."""
+    norm = normalize(speech)
+    return bool(norm) and _is_guarded(norm)
+
+
+def is_stop_request(speech):
+    """True when the party asks for the call to stop."""
+    norm = normalize(speech)
+    return bool(norm) and any(_contains_phrase(norm, p) for p in STOP_PHRASES)
+
+
 @dataclass
 class Reply:
     parts: list = field(default_factory=list)  # lines for Muse to say, in order
