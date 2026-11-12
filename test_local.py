@@ -27,6 +27,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import briefs as brief_store  # noqa: E402
+import llm as llm_mod  # noqa: E402
 import transcripts as transcripts_mod  # noqa: E402
 
 PORT = 8791
@@ -364,6 +365,16 @@ def main():
             req = urllib.request.Request(base3 + path, data=data, method="POST")
             with urllib.request.urlopen(req, timeout=15) as resp:
                 return resp.status, resp.read().decode("utf-8")
+
+        brain_unit = llm_mod.LLMBrain("http://127.0.0.1:9", "unit-model")
+        unit_msgs = brain_unit.messages(
+            SAMPLE_BRIEF, [{"kind": "speech", "speaker": "party", "text": "Hello?"}]
+        )
+        check("llm messages anchor the opening as the first assistant turn",
+              unit_msgs[1]["role"] == "assistant"
+              and unit_msgs[1]["content"] == SAMPLE_BRIEF["opening"])
+        check("llm messages put the party last as the user",
+              unit_msgs[-1]["role"] == "user" and unit_msgs[-1]["content"] == "Hello?")
 
         call_llm = brief_store.create_brief(SAMPLE_BRIEF, call_id="llm-chat",
                                             briefs_dir=briefs3)
