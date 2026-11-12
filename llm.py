@@ -29,6 +29,11 @@ Configuration (environment):
   LLM_API_KEY         optional bearer key (LiteLLM master key, when the
                       gateway requires one)
   LLM_TIMEOUT_SECONDS default 10 (Twilio will not wait long for TwiML)
+  LLM_TEMPERATURE     default 0.6. Set to "omit" for models that reject
+                      a temperature outright (the Claude 5.x family and
+                      Opus 4.7 return 400 for any request carrying one,
+                      verified through LiteLLM Nov 12, 2026); with it
+                      omitted, switching to those models is env-only.
 """
 import json
 import os
@@ -47,11 +52,13 @@ class LLMError(Exception):
 
 
 class LLMBrain:
-    def __init__(self, base_url, model=DEFAULT_MODEL, api_key=None, timeout=10):
+    def __init__(self, base_url, model=DEFAULT_MODEL, api_key=None, timeout=10,
+                 temperature=0.6):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.api_key = api_key
         self.timeout = timeout
+        self.temperature = temperature  # None means: omit the field entirely
 
     # --- prompt construction ------------------------------------------
     def system_prompt(self, brief):
@@ -114,9 +121,10 @@ Ending the call:
             # speakable text exists, and a tight cap intermittently
             # returns NO text at all (observed live Nov 12, 2026).
             "max_tokens": 800,
-            "temperature": 0.6,
             "messages": self.messages(brief, turns),
         }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
         headers = {"content-type": "application/json"}
         if self.api_key:
             headers["authorization"] = f"Bearer {self.api_key}"
@@ -163,9 +171,20 @@ def from_env(env=None):
         timeout = int(env.get("LLM_TIMEOUT_SECONDS", "10"))
     except ValueError:
         timeout = 10
+    raw_temp = (env.get("LLM_TEMPERATURE") or "").strip().lower()
+    if raw_temp in ("omit", "none", "off"):
+        temperature = None
+    elif raw_temp:
+        try:
+            temperature = float(raw_temp)
+        except ValueError:
+            temperature = 0.6
+    else:
+        temperature = 0.6
     return LLMBrain(
         base_url=base_url,
         model=env.get("LLM_MODEL") or DEFAULT_MODEL,
         api_key=env.get("LLM_API_KEY") or None,
         timeout=timeout,
+        temperature=temperature,
     )
