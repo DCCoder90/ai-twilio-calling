@@ -376,6 +376,44 @@ def main():
         check("llm messages put the party last as the user",
               unit_msgs[-1]["role"] == "user" and unit_msgs[-1]["content"] == "Hello?")
 
+        captured = {}
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "choices": [{"message": {"content": "unit reply"},
+                                 "finish_reason": "stop"}]
+                }).encode("utf-8")
+
+        def _fake_urlopen(req, timeout=None):
+            captured["payload"] = json.loads(req.data.decode("utf-8"))
+            return _FakeResp()
+
+        real_urlopen = llm_mod.urllib.request.urlopen
+        llm_mod.urllib.request.urlopen = _fake_urlopen
+        try:
+            unit_turns = [{"kind": "speech", "speaker": "party", "text": "Hi"}]
+            brain_unit.reply(SAMPLE_BRIEF, unit_turns)
+            check("llm payload sends temperature 0.6 by default",
+                  captured["payload"].get("temperature") == 0.6)
+            brain_omit = llm_mod.LLMBrain("http://127.0.0.1:9", "unit-model",
+                                          temperature=None)
+            brain_omit.reply(SAMPLE_BRIEF, unit_turns)
+            check("llm payload omits temperature when configured (5.x models reject it)",
+                  "temperature" not in captured["payload"])
+            env_omit = llm_mod.from_env({"LLM_BASE_URL": "http://127.0.0.1:9",
+                                         "LLM_TEMPERATURE": "omit"})
+            check("LLM_TEMPERATURE=omit parses to no temperature",
+                  env_omit is not None and env_omit.temperature is None)
+        finally:
+            llm_mod.urllib.request.urlopen = real_urlopen
+
         call_llm = brief_store.create_brief(SAMPLE_BRIEF, call_id="llm-chat",
                                             briefs_dir=briefs3)
         status, body = post3(f"/twilio/voice?call_id={call_llm}")
