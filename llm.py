@@ -20,6 +20,11 @@ End-of-call contract: the system prompt tells the model to append the
 exact marker [[END]] when the call's purpose is achieved or the other
 party wraps up. The server strips the marker and hangs up.
 
+Two call shapes share this module: reply() (one blocking request per
+turn, for the TwiML Gather flow) and stream_reply() (SSE streaming with
+sentence-sized chunks and mid-stream cancellation, for the
+ConversationRelay flow in server.py).
+
 Configuration (environment):
   LLM_BASE_URL        required to enable this brain at all, e.g.
                       http://litellm:4000 (the gateway's /chat/completions
@@ -49,6 +54,44 @@ _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 class LLMError(Exception):
     """The model call failed; the server falls back to a scripted line."""
+
+
+class StreamCancelled(Exception):
+    """Raised by a stream chunk callback to abort generation (the
+    caller interrupted; nothing further should be spoken)."""
+
+
+_SENTENCE_SPLIT = re.compile(r"(?<=[.!?])\s+")
+
+
+def _clean_stream_text(raw, final):
+    """Speakable text from the raw streamed content so far.
+
+    Strips closed <think> blocks, holds an unterminated one back, cuts
+    at the end marker, and (unless final) holds back a tail that could
+    be the start of a think tag or the end marker. The result is
+    prefix-stable as raw grows, which is what makes incremental
+    emission safe. Returns (text, end_marker_seen).
+    """
+    text = _THINK_BLOCK.sub("", raw)
+    end = False
+    idx = text.find("<think>")
+    if idx != -1:
+        text = text[:idx]
+    idx = text.find(END_MARKER)
+    if idx != -1:
+        end = True
+        text = text[:idx]
+    if not final and not end:
+        hold = 0
+        for marker in ("<think>", END_MARKER):
+            for cut in range(len(marker) - 1, 0, -1):
+                if text.endswith(marker[:cut]):
+                    hold = max(hold, cut)
+                    break
+        if hold:
+            text = text[:-hold]
+    return text, end
 
 
 class LLMBrain:
@@ -112,8 +155,7 @@ Ending the call:
         return history
 
     # --- the call -------------------------------------------------------
-    def reply(self, brief, turns):
-        """Return (text, end_call). Raises LLMError on any failure."""
+    def _payload(self, brief, turns, stream=False):
         payload = {
             "model": self.model,
             # Generous on purpose: reasoning models served through the
@@ -123,17 +165,26 @@ Ending the call:
             "max_tokens": 800,
             "messages": self.messages(brief, turns),
         }
+        if stream:
+            payload["stream"] = True
         if self.temperature is not None:
             payload["temperature"] = self.temperature
+        return payload
+
+    def _request(self, payload):
         headers = {"content-type": "application/json"}
         if self.api_key:
             headers["authorization"] = f"Bearer {self.api_key}"
-        request = urllib.request.Request(
+        return urllib.request.Request(
             f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             method="POST",
             headers=headers,
         )
+
+    def reply(self, brief, turns):
+        """Return (text, end_call). Raises LLMError on any failure."""
+        request = self._request(self._payload(brief, turns))
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
@@ -158,6 +209,84 @@ Ending the call:
         if not text:
             raise LLMError("model returned only the end marker")
         return text, end
+
+    def stream_reply(self, brief, turns, on_chunk):
+        """Stream one reply from the endpoint (OpenAI-style SSE).
+
+        on_chunk(text) is called with sentence-sized chunks of
+        speakable text as they become available; it may raise
+        StreamCancelled to abort generation (barge-in). Returns
+        (emitted_text, end_call, cancelled), where emitted_text is
+        exactly the concatenation of the chunks on_chunk accepted.
+        Raises LLMError on transport failure or when the model produced
+        no speakable text.
+        """
+        request = self._request(self._payload(brief, turns, stream=True))
+        emitted = ""
+        pending = ""
+        accounted = 0  # chars of the cleaned text already in emitted+pending
+        raw = ""
+        finish_reason = None
+
+        def emit(chunk):
+            nonlocal emitted
+            on_chunk(chunk)
+            emitted += chunk
+
+        def drain(final, end_seen):
+            """Move newly speakable text into chunks. Returns True when
+            the end marker was seen and everything is flushed."""
+            nonlocal pending, accounted
+            clean, end = _clean_stream_text(raw, final=final)
+            end = end or end_seen
+            if len(clean) > accounted:
+                pending += clean[accounted:]
+                accounted = len(clean)
+            if end or final:
+                if pending:
+                    emit(pending)
+                    pending = ""
+            else:
+                parts = _SENTENCE_SPLIT.split(pending)
+                for part in parts[:-1]:
+                    emit(part + " ")
+                pending = parts[-1] if parts else ""
+            return end
+
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as resp:
+                end_seen = False
+                for raw_line in resp:
+                    line = raw_line.decode("utf-8", "replace").strip()
+                    if not line.startswith("data:"):
+                        continue
+                    data = line[len("data:"):].strip()
+                    if data == "[DONE]":
+                        break
+                    try:
+                        event = json.loads(data)
+                        choice = event["choices"][0]
+                        piece = (choice.get("delta") or {}).get("content") or ""
+                        if choice.get("finish_reason"):
+                            finish_reason = choice["finish_reason"]
+                    except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+                        continue
+                    if not piece:
+                        continue
+                    raw += piece
+                    if drain(final=False, end_seen=end_seen):
+                        end_seen = True
+                        break
+                end = drain(final=True, end_seen=end_seen)
+        except StreamCancelled:
+            return emitted, False, True
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+            raise LLMError(f"LLM stream failed: {exc}") from exc
+        if not emitted.strip():
+            raise LLMError(
+                f"LLM stream carried no speakable text (finish_reason={finish_reason})"
+            )
+        return emitted, end, False
 
 
 def from_env(env=None):
