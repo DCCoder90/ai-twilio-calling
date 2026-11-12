@@ -85,6 +85,38 @@ def deflect_count(call_id, transcripts_dir=DEFAULT_TRANSCRIPTS_DIR):
     )
 
 
+def rewrite_last_muse_turn(call_id, new_text, transcripts_dir=DEFAULT_TRANSCRIPTS_DIR):
+    """Rewrite the most recent muse reply/opening turn's text in place.
+
+    Used by the ConversationRelay path when the party barges in: the
+    transcript (and therefore the history the model sees next) must
+    record only what the party actually heard, which Twilio reports as
+    utteranceUntilInterrupt. Pass new_text=None to drop the turn
+    entirely (nothing was heard). Returns True when a turn was found.
+    """
+    path = transcript_path(call_id, transcripts_dir)
+    if not path.exists():
+        return False
+    entries = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if line:
+            entries.append(json.loads(line))
+    for i in range(len(entries) - 1, -1, -1):
+        entry = entries[i]
+        if entry.get("speaker") == "muse" and entry.get("kind") in ("reply", "opening"):
+            if new_text is None:
+                del entries[i]
+            else:
+                entry["text"] = new_text
+                entry["interrupted"] = True
+            path.write_text(
+                "".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8"
+            )
+            return True
+    return False
+
+
 def write_outcome(call_id, brief, reason, transcripts_dir=DEFAULT_TRANSCRIPTS_DIR):
     """Write the end-of-call summary JSON. Returns the outcome dict."""
     turns = read_turns(call_id, transcripts_dir)
