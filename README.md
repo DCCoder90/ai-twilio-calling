@@ -248,7 +248,7 @@ Authentication model:
 | `LLM_TEMPERATURE` | no | `0.6` | A float, or `omit` for models that reject the field (Claude 5.x, Opus 4.7). |
 | `VOICE_MODE` | no | `gather` | `gather` = turn-based TwiML (stock `<Say>` voice). `relay` = ConversationRelay streaming (below). |
 | `RELAY_TTS_PROVIDER` | no | `Amazon` | Relay TTS provider: `Amazon`, `Google`, or `ElevenLabs` (ElevenLabs needs account enablement on Twilio's side). |
-| `RELAY_VOICE` | no | `Polly.Matthew-Neural` | Relay voice, in the provider's naming (`Polly.*` for Amazon, `Google.en-US-Neural2-*` style for Google, a voice ID for ElevenLabs). |
+| `RELAY_VOICE` | no | `Matthew-Neural` | Relay voice, in ConversationRelay's naming: the BARE voice name for Amazon/Google (`Matthew-Neural`, `en-US-Chirp3-HD-Aoede`), a voice ID for ElevenLabs. NOT the `<Say>` format — `Polly.Matthew-Neural` is accepted at setup but every synthesis fails and the caller hears silence (a `Polly.` prefix on an Amazon voice is stripped automatically, as a guard). |
 | `RELAY_TRANSCRIPTION_PROVIDER` | no | — (Twilio default) | Relay speech-to-text provider, e.g. `Deepgram` or `Google`. |
 | `RELAY_SPEECH_MODEL` | no | — (provider default) | Relay STT model, e.g. a Deepgram model name. |
 | `RELAY_INTERRUPTIBLE` | no | `any` | Who may barge in on the relay voice: `any`, `speech`, `dtmf`, or `none`. |
