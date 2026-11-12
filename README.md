@@ -77,14 +77,13 @@ created. The service itself should not be exposed directly.
 1. Ernest approves the call (recipient, purpose, key points). One approval
    per call.
 2. Muse writes the brief and hands Ernest the brief JSON file.
-3. Ernest drops it in `data/briefs/<call_id>.json` on the host.
+3. Muse posts it to `POST /briefs` on the service (authenticated by
+   the `BRIEF_INGEST_SECRET` deployment env var, sent as the
+   `X-Ingest-Secret` header); a call_id that already has a transcript
+   is spent and refused with 409.
 4. Muse creates the call through Twilio with the webhook base above.
-5. Transcripts and the outcome file land in `data/transcripts/` on the
-   host; Muse reports the outcome to Ernest from Twilio's call status
-   plus the transcript once it's synced back.
-
-Planned v1.1: an authenticated brief-ingest endpoint on the service so
-step 3 disappears and Muse pushes the brief directly before dialing.
+5. After the call, Muse fetches `GET /transcripts/<call_id>` (same
+   secret) and reports the outcome to Ernest from the transcript.
 
 ## Local development
 
