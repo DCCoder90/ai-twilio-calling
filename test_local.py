@@ -27,6 +27,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import briefs as brief_store  # noqa: E402
+import transcripts as transcripts_mod  # noqa: E402
 
 PORT = 8791
 BASE = f"http://127.0.0.1:{PORT}"
@@ -198,6 +199,10 @@ def main():
         check("status callback returns 200", status == 200)
         check("status callback logged to transcript dir",
               (transcripts_dir / "test-status.jsonl").exists())
+        check("status callbacks do not count as party speech turns",
+              transcripts_mod.party_turn_count("test-status", transcripts_dir) == 0)
+        check("party speech turns are counted exactly",
+              transcripts_mod.party_turn_count(call_main, transcripts_dir) == 2)
 
         # A hostile call_id must not name files outside the transcripts
         # dir (the status route used to take it unchecked).
