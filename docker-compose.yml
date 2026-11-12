@@ -24,3 +24,4 @@ services:
       VOICE_MODE: "${VOICE_MODE:-gather}"
       RELAY_TTS_PROVIDER: "${RELAY_TTS_PROVIDER:-Amazon}"
       RELAY_VOICE: "${RELAY_VOICE:-Joanna-Generative}"
+      RELAY_INTERRUPT_SENSITIVITY: "${RELAY_INTERRUPT_SENSITIVITY:-medium}"
