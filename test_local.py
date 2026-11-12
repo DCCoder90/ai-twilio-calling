@@ -8,11 +8,16 @@ plain HTTP form posts. No network beyond 127.0.0.1, no Twilio account.
 Run: python3 test_local.py
 Exit code 0 means every check passed.
 """
+import base64
+import hashlib
+import hmac
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -71,6 +76,18 @@ def post(path, form=None):
     req = urllib.request.Request(BASE + path, data=data, method="POST")
     with urllib.request.urlopen(req, timeout=10) as resp:
         return resp.status, resp.read().decode("utf-8")
+
+
+def post_code(base, path, form=None, headers=None):
+    """POST and return just the HTTP status, including error statuses."""
+    data = urllib.parse.urlencode(form or {}).encode("utf-8")
+    req = urllib.request.Request(base + path, data=data, method="POST",
+                                 headers=headers or {})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
 
 
 def wait_for_server(proc, timeout=15):
@@ -179,12 +196,72 @@ def main():
         check("status callback returns 200", status == 200)
         check("status callback logged to transcript dir",
               (transcripts_dir / "test-status.jsonl").exists())
+
+        # A hostile call_id must not name files outside the transcripts
+        # dir (the status route used to take it unchecked).
+        evil = urllib.parse.quote("../../evilprobe", safe="")
+        code = post_code(BASE, f"/twilio/status?call_id={evil}",
+                         {"CallSid": "CA-test", "CallStatus": "ringing"})
+        check("status with traversal call_id is rejected (400)", code == 400)
+        check("traversal call_id wrote no file outside the transcripts dir",
+              not (Path(tmp) / "evilprobe.jsonl").exists()
+              and not (transcripts_dir / "evilprobe.jsonl").exists())
     finally:
         proc.terminate()
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+    # Signature suite: a second instance with TWILIO_AUTH_TOKEN set must
+    # reject unsigned requests and accept correctly signed ones.
+    port2 = 8792
+    base2 = f"http://127.0.0.1:{port2}"
+    briefs2 = Path(tmp) / "briefs2"
+    transcripts2 = Path(tmp) / "transcripts2"
+    token = "test-secret-token"
+    env = dict(os.environ, TWILIO_AUTH_TOKEN=token)
+    proc2 = subprocess.Popen(
+        [
+            sys.executable, str(HERE / "server.py"),
+            "--port", str(port2),
+            "--briefs-dir", str(briefs2),
+            "--transcripts-dir", str(transcripts2),
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env,
+    )
+    try:
+        deadline = time.time() + 15
+        while True:
+            try:
+                with urllib.request.urlopen(base2 + "/health", timeout=2) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                if time.time() > deadline:
+                    raise RuntimeError("signature-suite server did not start")
+                time.sleep(0.2)
+        brief_store.create_brief(SAMPLE_BRIEF, call_id="sig-test", briefs_dir=briefs2)
+
+        code = post_code(base2, "/twilio/voice?call_id=sig-test")
+        check("unsigned webhook POST is rejected when a token is set (403)", code == 403)
+
+        url = f"{base2}/twilio/voice?call_id=sig-test"
+        mac = hmac.new(token.encode(), url.encode(), hashlib.sha1)
+        signature = base64.b64encode(mac.digest()).decode()
+        req = urllib.request.Request(url, data=b"", method="POST",
+                                     headers={"X-Twilio-Signature": signature})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            body = resp.read().decode()
+            code = resp.status
+        check("correctly signed webhook POST is accepted (200)", code == 200)
+        check("signed voice webhook speaks the opening", SAMPLE_BRIEF["opening"] in body)
+    finally:
+        proc2.terminate()
+        try:
+            proc2.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc2.kill()
 
     print()
     if FAILURES:
