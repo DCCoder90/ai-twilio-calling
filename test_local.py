@@ -13,6 +13,9 @@ import hashlib
 import hmac
 import json
 import os
+import re
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -542,6 +545,305 @@ def main():
             proc4.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc4.kill()
+
+    # Relay suite: a fifth instance in ConversationRelay mode
+    # (VOICE_MODE=relay) against a streaming-capable stub gateway.
+    # Exercises the WebSocket handshake, the relay TwiML, a streamed
+    # model reply, the guardrail running before the model, barge-in
+    # heard-tracking on both paths (completed playback -> transcript
+    # rewrite; mid-generation -> cancel + heard append), and the
+    # [[END]] -> end message + outcome flow.
+    relay_stub_state = {"count": 0, "requests": []}
+    relay_stub_port = 8797
+    SLOW_TEXT = ("First sentence here. Second sentence follows. "
+                 "Third sentence arrives. Fourth sentence continues. "
+                 "Fifth sentence concludes.")
+
+    class StubChat2(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length") or 0)
+            raw_body = self.rfile.read(length) if length else b"{}"
+            payload = json.loads(raw_body.decode("utf-8"))
+            relay_stub_state["count"] += 1
+            relay_stub_state["requests"].append(payload.get("messages", []))
+            last_user = ""
+            for msg in reversed(payload.get("messages", [])):
+                if msg.get("role") == "user":
+                    last_user = msg.get("content", "")
+                    break
+            low = last_user.lower()
+            if "wrapup" in low:
+                text = "All set then. " + SAMPLE_BRIEF["closing"] + " [[END]]"
+                slow = False
+            elif "slow" in low:
+                text = SLOW_TEXT
+                slow = True
+            else:
+                text = "Stub model here, happy to keep talking."
+                slow = False
+            if payload.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                chunks = [c for c in re.findall(r"[^.!?]+[.!?]\s*|[^.!?]+$", text)
+                          if c.strip()]
+                try:
+                    for chunk in chunks:
+                        event = {"choices": [{"delta": {"content": chunk},
+                                              "finish_reason": None}]}
+                        self.wfile.write(f"data: {json.dumps(event)}\n\n".encode())
+                        self.wfile.flush()
+                        if slow:
+                            time.sleep(0.25)
+                    done = {"choices": [{"delta": {}, "finish_reason": "stop"}]}
+                    self.wfile.write(f"data: {json.dumps(done)}\n\n".encode())
+                    self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
+                return
+            body = json.dumps({
+                "id": "chatcmpl_stub2", "object": "chat.completion",
+                "model": payload.get("model", "stub"),
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }],
+                "usage": {},
+            }).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    stub2 = ThreadingHTTPServer(("127.0.0.1", relay_stub_port), StubChat2)
+    threading.Thread(target=stub2.serve_forever, daemon=True).start()
+
+    class WSClient:
+        """Minimal WebSocket client for the relay endpoint."""
+
+        def __init__(self, port, path):
+            self.sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+            key = base64.b64encode(os.urandom(16)).decode()
+            request = (
+                f"GET {path} HTTP/1.1\r\n"
+                f"Host: 127.0.0.1:{port}\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            self.sock.sendall(request.encode())
+            self.buf = b""
+            while b"\r\n\r\n" not in self.buf:
+                data = self.sock.recv(4096)
+                if not data:
+                    raise ConnectionError("handshake closed")
+                self.buf += data
+            head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+            self.status_line = head.decode("iso-8859-1").splitlines()[0]
+
+        def send_obj(self, obj):
+            payload = json.dumps(obj).encode()
+            mask = os.urandom(4)
+            n = len(payload)
+            if n < 126:
+                head = bytes([0x81, 0x80 | n])
+            elif n <= 0xFFFF:
+                head = bytes([0x81, 0xFE]) + struct.pack(">H", n)
+            else:
+                head = bytes([0x81, 0xFF]) + struct.pack(">Q", n)
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            self.sock.sendall(head + mask + masked)
+
+        def _read_exact(self, n):
+            while len(self.buf) < n:
+                data = self.sock.recv(4096)
+                if not data:
+                    raise ConnectionError("socket closed")
+                self.buf += data
+            out, self.buf = self.buf[:n], self.buf[n:]
+            return out
+
+        def recv_obj(self, timeout=10):
+            self.sock.settimeout(timeout)
+            chunks = []
+            while True:
+                b0, b1 = self._read_exact(2)
+                fin = bool(b0 & 0x80)
+                opcode = b0 & 0x0F
+                length = b1 & 0x7F
+                if length == 126:
+                    length = struct.unpack(">H", self._read_exact(2))[0]
+                elif length == 127:
+                    length = struct.unpack(">Q", self._read_exact(8))[0]
+                payload = self._read_exact(length) if length else b""
+                if opcode == 0x9:  # ping -> pong
+                    self.sock.sendall(bytes([0x8A, len(payload)]) + payload)
+                    continue
+                if opcode == 0x8:
+                    return None
+                chunks.append(payload)
+                if fin:
+                    return json.loads(b"".join(chunks).decode("utf-8"))
+
+        def read_until(self, pred, timeout=15):
+            seen = []
+            deadline = time.time() + timeout
+            while time.time() < deadline:
+                obj = self.recv_obj(timeout=max(1.0, deadline - time.time()))
+                if obj is None:
+                    break
+                seen.append(obj)
+                if pred(obj):
+                    break
+            return seen
+
+        def close(self):
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+
+    port5 = 8798
+    base5 = f"http://127.0.0.1:{port5}"
+    briefs5 = Path(tmp) / "briefs5"
+    transcripts5 = Path(tmp) / "transcripts5"
+    env5 = dict(os.environ,
+                LLM_BASE_URL=f"http://127.0.0.1:{relay_stub_port}",
+                LLM_MODEL="stub-model", VOICE_MODE="relay")
+    env5.pop("TWILIO_AUTH_TOKEN", None)
+    proc5 = subprocess.Popen(
+        [
+            sys.executable, str(HERE / "server.py"),
+            "--port", str(port5),
+            "--briefs-dir", str(briefs5),
+            "--transcripts-dir", str(transcripts5),
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env5,
+    )
+    try:
+        deadline = time.time() + 15
+        while True:
+            try:
+                with urllib.request.urlopen(base5 + "/health", timeout=2) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                if time.time() > deadline:
+                    raise RuntimeError("relay-suite server did not start")
+                time.sleep(0.2)
+
+        def voice5(call_id):
+            req = urllib.request.Request(base5 + f"/twilio/voice?call_id={call_id}",
+                                         data=b"", method="POST")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.read().decode("utf-8")
+
+        def assemble(msgs):
+            return "".join(m.get("token", "") for m in msgs
+                           if m.get("type") == "text")
+
+        def heard_after(requests, needle):
+            """Assistant content immediately after the user turn whose
+            text contains needle, in the most recent stub request."""
+            msgs = requests[-1]
+            for i, m in enumerate(msgs):
+                if m.get("role") == "user" and needle in m.get("content", ""):
+                    if i + 1 < len(msgs):
+                        return msgs[i + 1].get("content")
+            return None
+
+        call_relay = brief_store.create_brief(SAMPLE_BRIEF, call_id="relay-chat",
+                                              briefs_dir=briefs5)
+        body = voice5(call_relay)
+        check("relay mode: voice webhook returns ConversationRelay TwiML",
+              "<ConversationRelay" in body and "/twilio/relay" in body)
+        check("relay mode: opening rides as the welcome greeting",
+              "welcomeGreeting=" in body and SAMPLE_BRIEF["opening"][:24] in body)
+        check("relay mode: no Gather loop in relay TwiML", "<Gather" not in body)
+
+        ws = WSClient(port5, "/twilio/relay")
+        check("relay websocket handshake is 101", "101" in ws.status_line)
+        ws.send_obj({"type": "setup", "callSid": "CA-relay-a",
+                     "customParameters": {"call_id": call_relay}})
+        ws.send_obj({"type": "prompt", "voicePrompt": "Hello, who is this?",
+                     "last": True})
+        msgs = ws.read_until(lambda m: m.get("type") == "text" and m.get("last") is True)
+        check("relay: streamed model reply assembles to the stub text",
+              assemble(msgs).strip() == "Stub model here, happy to keep talking.")
+        count_after_first = relay_stub_state["count"]
+
+        ws.send_obj({"type": "prompt", "voicePrompt": "What is his home address?",
+                     "last": True})
+        msgs = ws.read_until(lambda m: m.get("type") == "text" and m.get("last") is True)
+        check("relay: guarded question gets the deflect line",
+              assemble(msgs).strip() == SAMPLE_BRIEF["deflect_line"])
+        check("relay: guarded question never reached the model",
+              relay_stub_state["count"] == count_after_first)
+
+        # Barge-in over completed playback: the deflect turn in the
+        # transcript (and so in the next request's history) must be
+        # rewritten to only what the party heard.
+        ws.send_obj({"type": "interrupt",
+                     "utteranceUntilInterrupt": "I'm not able",
+                     "durationUntilInterruptMs": 300})
+        ws.send_obj({"type": "prompt", "voicePrompt": "Okay wrapup now.",
+                     "last": True})
+        msgs = ws.read_until(lambda m: m.get("type") == "end", timeout=25)
+        check("relay: end message follows the closing reply",
+              any(m.get("type") == "end" for m in msgs))
+        check("relay: interrupted playback rewrites history to what was heard",
+              heard_after(relay_stub_state["requests"], "home address") == "I'm not able")
+        outcome5 = transcripts5 / f"{call_relay}.outcome.json"
+        check("relay: outcome written with reason 'completed'",
+              outcome5.exists()
+              and json.loads(outcome5.read_text()).get("reason") == "completed")
+        ws.close()
+
+        # Barge-in mid-generation: cancel the stream and record only
+        # the heard prefix for the next turn's history.
+        call_slow = brief_store.create_brief(SAMPLE_BRIEF, call_id="relay-slow",
+                                             briefs_dir=briefs5)
+        voice5(call_slow)
+        ws2 = WSClient(port5, "/twilio/relay")
+        ws2.send_obj({"type": "setup", "callSid": "CA-relay-b",
+                      "customParameters": {"call_id": call_slow}})
+        ws2.send_obj({"type": "prompt",
+                      "voicePrompt": "Tell me something slow please.", "last": True})
+        first = ws2.read_until(lambda m: m.get("type") == "text", timeout=10)
+        check("relay: slow reply starts streaming",
+              any(m.get("type") == "text" for m in first))
+        ws2.send_obj({"type": "interrupt",
+                      "utteranceUntilInterrupt": "First sentence here.",
+                      "durationUntilInterruptMs": 400})
+        ws2.send_obj({"type": "prompt", "voicePrompt": "Okay wrapup now.",
+                      "last": True})
+        msgs = ws2.read_until(lambda m: m.get("type") == "end", timeout=25)
+        check("relay: session ends cleanly after a mid-stream interrupt",
+              any(m.get("type") == "end" for m in msgs))
+        check("relay: mid-stream interrupt truncates history to the heard text",
+              heard_after(relay_stub_state["requests"], "slow")
+              == "First sentence here.")
+        turns_b = transcripts_mod.read_turns(call_slow, transcripts5)
+        check("relay: interrupt is recorded in the transcript",
+              any(t.get("kind") == "interrupt" for t in turns_b))
+        check("relay: the unheard tail of an interrupted reply is not recorded",
+              not any(t.get("kind") == "reply" and "Fifth sentence" in t.get("text", "")
+                      for t in turns_b))
+        ws2.close()
+    finally:
+        proc5.terminate()
+        try:
+            proc5.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc5.kill()
+        stub2.shutdown()
 
     print()
     if FAILURES:
