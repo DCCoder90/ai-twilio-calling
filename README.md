@@ -252,6 +252,7 @@ Authentication model:
 | `RELAY_TRANSCRIPTION_PROVIDER` | no | — (Twilio default) | Relay speech-to-text provider, e.g. `Deepgram` or `Google`. |
 | `RELAY_SPEECH_MODEL` | no | — (provider default) | Relay STT model, e.g. a Deepgram model name. |
 | `RELAY_INTERRUPTIBLE` | no | `any` | Who may barge in on the relay voice: `any`, `speech`, `dtmf`, or `none`. |
+| `RELAY_INTERRUPT_SENSITIVITY` | no | `medium` | How easily caller speech interrupts playback: `high`, `medium`, or `low`. Twilio's own default is `high`, which let TV noise cut in on a live call (Nov 12, 2026); `medium` is the balanced step down, `low` requires longer, more confident speech. Invalid values fall back to `medium`. |
 
 ### CLI flags
 
