@@ -6,11 +6,22 @@ transcripts/<call_id>.jsonl. When a call ends, a summary is written to
 transcripts/<call_id>.outcome.json.
 """
 import json
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 DEFAULT_TRANSCRIPTS_DIR = BASE_DIR / "transcripts"
+
+# A call_id becomes a filename. Accept only the same shape briefs.py
+# validates, so no caller-supplied value can escape the transcripts dir.
+SAFE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _check_id(call_id):
+    if not SAFE_ID_RE.match(call_id or ""):
+        raise ValueError(f"unsafe call_id for a transcript path: {call_id!r}")
+    return call_id
 
 
 def _now_iso():
@@ -18,11 +29,11 @@ def _now_iso():
 
 
 def transcript_path(call_id, transcripts_dir=DEFAULT_TRANSCRIPTS_DIR):
-    return Path(transcripts_dir) / f"{call_id}.jsonl"
+    return Path(transcripts_dir) / f"{_check_id(call_id)}.jsonl"
 
 
 def outcome_path(call_id, transcripts_dir=DEFAULT_TRANSCRIPTS_DIR):
-    return Path(transcripts_dir) / f"{call_id}.outcome.json"
+    return Path(transcripts_dir) / f"{_check_id(call_id)}.outcome.json"
 
 
 def append_turn(call_id, speaker, text, kind, tag=None, transcripts_dir=DEFAULT_TRANSCRIPTS_DIR):
