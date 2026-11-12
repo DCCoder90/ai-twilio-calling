@@ -134,6 +134,13 @@ def main():
         status, body = post(f"/twilio/voice?call_id={call_main}")
         check("voice webhook returns 200", status == 200)
         check("voice webhook speaks the brief opening", SAMPLE_BRIEF["opening"] in body)
+
+        quiet_brief = dict(SAMPLE_BRIEF, listen_prompt="")
+        call_quiet = "test-quiet"
+        brief_store.create_brief(quiet_brief, call_id=call_quiet, briefs_dir=briefs_dir)
+        status, body = post(f"/twilio/voice?call_id={call_quiet}")
+        check("empty listen_prompt yields a bare Gather (no spoken prompt)",
+              '<Gather input="speech"' in body and body.count("<Say>") == 1)
         check("voice webhook opens a speech Gather",
               "<Gather" in body and 'input="speech"' in body and "speechTimeout=" in body)
         check("voice webhook does not hang up", "<Hangup" not in body)
