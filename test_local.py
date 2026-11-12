@@ -406,6 +406,87 @@ def main():
             proc3.kill()
         stub.shutdown()
 
+    # Ingest suite: a fourth instance with BRIEF_INGEST_SECRET set.
+    # Muse's hands-free flow: post an approved brief, dial against it,
+    # fetch the transcript afterward. Auth on both routes, validation,
+    # and the spent-call_id rule are all exercised.
+    port4 = 8794
+    base4 = f"http://127.0.0.1:{port4}"
+    briefs4 = Path(tmp) / "briefs4"
+    transcripts4 = Path(tmp) / "transcripts4"
+    ingest_secret = "ingest-test-secret"
+    env4 = dict(os.environ, BRIEF_INGEST_SECRET=ingest_secret)
+    proc4 = subprocess.Popen(
+        [
+            sys.executable, str(HERE / "server.py"),
+            "--port", str(port4),
+            "--briefs-dir", str(briefs4),
+            "--transcripts-dir", str(transcripts4),
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, env=env4,
+    )
+
+    def raw(method, base, path, payload=None, headers=None):
+        data = None
+        hdrs = dict(headers or {})
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+            hdrs["Content-Type"] = "application/json"
+        req = urllib.request.Request(base + path, data=data, method=method, headers=hdrs)
+        try:
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                return resp.status, resp.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read().decode("utf-8")
+
+    try:
+        deadline = time.time() + 15
+        while True:
+            try:
+                with urllib.request.urlopen(base4 + "/health", timeout=2) as resp:
+                    if resp.status == 200:
+                        break
+            except Exception:
+                if time.time() > deadline:
+                    raise RuntimeError("ingest-suite server did not start")
+                time.sleep(0.2)
+
+        good = {"X-Ingest-Secret": ingest_secret}
+        code, _ = raw("POST", base4, "/briefs",
+                      {"call_id": "ingest-1", "brief": SAMPLE_BRIEF})
+        check("ingest without the secret is refused (401)", code == 401)
+        code, _ = raw("POST", base4, "/briefs",
+                      {"call_id": "ingest-1", "brief": SAMPLE_BRIEF},
+                      {"X-Ingest-Secret": "wrong"})
+        check("ingest with the wrong secret is refused (401)", code == 401)
+        code, _ = raw("POST", base4, "/briefs",
+                      {"call_id": "ingest-1", "brief": {"to": "+1"}}, good)
+        check("ingest of an invalid brief is refused (400)", code == 400)
+        code, body = raw("POST", base4, "/briefs",
+                         {"call_id": "ingest-1", "brief": SAMPLE_BRIEF}, good)
+        check("ingest of a valid brief succeeds (200)", code == 200, body)
+
+        req = urllib.request.Request(base4 + "/twilio/voice?call_id=ingest-1",
+                                     data=b"", method="POST")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            vbody = resp.read().decode("utf-8")
+        check("ingested brief serves the voice webhook", SAMPLE_BRIEF["opening"] in vbody)
+        code, _ = raw("GET", base4, "/transcripts/ingest-1")
+        check("transcript fetch without the secret is refused (401)", code == 401)
+        code, tbody = raw("GET", base4, "/transcripts/ingest-1", None, good)
+        tdata = json.loads(tbody) if code == 200 else {}
+        check("transcript fetch with the secret returns the turns",
+              code == 200 and any(t.get("kind") == "opening" for t in tdata.get("turns", [])))
+        code, _ = raw("POST", base4, "/briefs",
+                      {"call_id": "ingest-1", "brief": SAMPLE_BRIEF}, good)
+        check("re-ingesting a spent call_id is refused (409)", code == 409)
+    finally:
+        proc4.terminate()
+        try:
+            proc4.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc4.kill()
+
     print()
     if FAILURES:
         print(f"{len(FAILURES)} check(s) FAILED: {', '.join(FAILURES)}")
