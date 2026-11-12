@@ -59,9 +59,14 @@ def say(text):
 
 def gather(call_id, listen_prompt):
     action = escape(f"/twilio/gather?call_id={call_id}", {'"': "&quot;"})
+    # An empty listen_prompt means a bare Gather: just listen. In LLM
+    # mode the model's replies end in their own questions, and tacking
+    # a spoken "Go ahead." onto every turn sounds robotic and confuses
+    # the other party (observed live Nov 12, 2026).
+    inner = say(listen_prompt) if listen_prompt else ""
     return (
         f'<Gather input="speech" action="{action}" method="POST" speechTimeout="auto">'
-        f"{say(listen_prompt)}</Gather>"
+        f"{inner}</Gather>"
     )
 
 
