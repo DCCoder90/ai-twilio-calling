@@ -287,7 +287,7 @@ def main():
     print(f"twilio-calling server on http://{args.host}:{args.port} "
           f"(briefs={server.briefs_dir}, transcripts={server.transcripts_dir}, "
           f"signature verification: {'on' if server.auth_token else 'OFF - local dev only'}, "
-          f"brain: {('anthropic ' + server.brain.model) if server.brain else 'deterministic responder'})")
+          f"brain: {(server.brain.model + ' @ ' + server.brain.base_url) if server.brain else 'deterministic responder'})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
