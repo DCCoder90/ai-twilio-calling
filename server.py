@@ -189,6 +189,7 @@ def relay_twiml(handler, parsed, call_id, brief, relay):
         f'ttsProvider="{attr(relay["tts_provider"])}"',
         f'voice="{attr(voice)}"',
         f'interruptible="{attr(relay["interruptible"])}"',
+        f'interruptSensitivity="{attr(relay.get("interrupt_sensitivity") or "medium")}"',
         'dtmfDetection="true"',
         f'welcomeGreeting="{attr(brief["opening"])}"',
         'welcomeGreetingInterruptible="any"',
@@ -858,6 +859,14 @@ def main():
                 os.environ.get("RELAY_TRANSCRIPTION_PROVIDER") or "",
             "speech_model": os.environ.get("RELAY_SPEECH_MODEL") or "",
             "interruptible": os.environ.get("RELAY_INTERRUPTIBLE") or "any",
+            # Twilio's default is "high" (easiest to trigger; TV noise
+            # cut in on a live call Nov 12, 2026). "medium" is the
+            # balanced step down; "low" needs longer, confident speech.
+            "interrupt_sensitivity":
+                (os.environ.get("RELAY_INTERRUPT_SENSITIVITY") or "medium")
+                .strip().lower()
+                if (os.environ.get("RELAY_INTERRUPT_SENSITIVITY") or "medium")
+                .strip().lower() in ("high", "medium", "low") else "medium",
         }
     server.briefs_dir.mkdir(parents=True, exist_ok=True)
     server.transcripts_dir.mkdir(parents=True, exist_ok=True)
@@ -866,7 +875,7 @@ def main():
           f"signature verification: {'on' if server.auth_token else 'OFF - local dev only'}, "
           f"ingest: {'on' if server.ingest_secret else 'off'}, "
           f"brain: {(server.brain.model + ' @ ' + server.brain.base_url) if server.brain else 'deterministic responder'}, "
-          f"voice mode: {('relay (' + server.relay['tts_provider'] + '/' + server.relay['voice'] + ')') if server.relay else 'gather'})")
+          f"voice mode: {('relay (' + server.relay['tts_provider'] + '/' + server.relay['voice'] + ', interrupt ' + server.relay['interrupt_sensitivity'] + ')') if server.relay else 'gather'})")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
