@@ -1,0 +1,14 @@
+services:
+  twilio-calling:
+    image: ghcr.io/dccoder90/ai-twilio-calling:latest
+    container_name: twilio-calling
+    restart: unless-stopped
+    ports:
+      # Local/lab access only. Twilio reaches the service through whatever
+      # public HTTPS front you put in front of this port (reverse proxy,
+      # Tailscale Funnel on this host, Cloudflare Tunnel on this host).
+      - "8765:8765"
+    volumes:
+      # Host folder holding briefs/ (drop approved brief JSON files here)
+      # and transcripts/ (call transcripts and outcome files land here).
+      - ./data:/data
