@@ -265,20 +265,21 @@ def main():
         except subprocess.TimeoutExpired:
             proc2.kill()
 
-    # LLM suite: a third instance with an Anthropic key pointing at a
-    # local stub of the Messages API. Checks the model path, the [[END]]
-    # contract, the deterministic guardrail running BEFORE the model,
-    # and the scripted fallback when the model call fails.
+    # LLM suite: a third instance pointed at a local stub of an
+    # OpenAI-compatible chat endpoint (the LiteLLM shape). Checks the
+    # model path, the [[END]] contract, the deterministic guardrail
+    # running BEFORE the model, and the scripted fallback when the
+    # model call fails.
     stub_state = {"count": 0, "fail": False}
     stub_port = 8793
 
-    class StubAnthropic(BaseHTTPRequestHandler):
+    class StubChat(BaseHTTPRequestHandler):
         def do_POST(self):
             length = int(self.headers.get("Content-Length") or 0)
             raw = self.rfile.read(length) if length else b"{}"
             stub_state["count"] += 1
             if stub_state["fail"]:
-                body = b'{"type":"error","error":{"type":"api_error","message":"stub down"}}'
+                body = b'{"error":{"message":"stub down","type":"api_error"}}'
                 self.send_response(500)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
@@ -294,12 +295,16 @@ def main():
             if "wrapup" in last_user.lower():
                 text = "All set then. " + SAMPLE_BRIEF["closing"] + " [[END]]"
             else:
-                text = "Stub Muse here, happy to keep talking."
+                text = "Stub model here, happy to keep talking."
             body = json.dumps({
-                "id": "msg_stub", "type": "message", "role": "assistant",
-                "content": [{"type": "text", "text": text}],
+                "id": "chatcmpl_stub", "object": "chat.completion",
                 "model": payload.get("model", "stub"),
-                "stop_reason": "end_turn", "usage": {},
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": text},
+                    "finish_reason": "stop",
+                }],
+                "usage": {},
             }).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
@@ -310,7 +315,7 @@ def main():
         def log_message(self, *args):
             pass
 
-    stub = ThreadingHTTPServer(("127.0.0.1", stub_port), StubAnthropic)
+    stub = ThreadingHTTPServer(("127.0.0.1", stub_port), StubChat)
     threading.Thread(target=stub.serve_forever, daemon=True).start()
 
     port3 = 8794
@@ -318,8 +323,8 @@ def main():
     briefs3 = Path(tmp) / "briefs3"
     transcripts3 = Path(tmp) / "transcripts3"
     env3 = dict(os.environ,
-                ANTHROPIC_API_KEY="test-key",
-                ANTHROPIC_BASE_URL=f"http://127.0.0.1:{stub_port}")
+                LLM_BASE_URL=f"http://127.0.0.1:{stub_port}",
+                LLM_MODEL="stub-model")
     env3.pop("TWILIO_AUTH_TOKEN", None)
     proc3 = subprocess.Popen(
         [
@@ -356,7 +361,7 @@ def main():
 
         status, body = post3(f"/twilio/gather?call_id={call_llm}",
                              {"SpeechResult": "Hello, who is this?"})
-        check("llm mode: model reply is spoken", "Stub Muse here" in body)
+        check("llm mode: model reply is spoken", "Stub model here" in body)
         check("llm mode: call continues after a model reply", "<Gather" in body)
         check("llm mode: model was called exactly once so far", stub_state["count"] == 1)
 
