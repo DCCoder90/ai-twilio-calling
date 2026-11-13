@@ -122,7 +122,19 @@ End conditions and the `reason` recorded in the outcome file:
 `completed` (model appended `[[END]]` after its closing line; the
 server strips the marker and hangs up), `guarded_wall`,
 `stop_requested`, `max_turns`, `party_hangup` (carrier reported the
-call over with no other end condition).
+call over with no other end condition), `voicemail_detected` (below).
+
+### Voicemail detection
+
+Calls never leave voicemail. The dialer requests Twilio answering
+machine detection on every call (`MachineDetection=Enable` by default;
+`DetectMessageEnd` and an off switch are available on the dialer).
+With synchronous AMD, Twilio holds the voice webhook until it has a
+verdict, so nothing has been spoken yet when the service decides: if
+`AnsweredBy` is any `machine*` value or `fax`, the voice route hangs
+up before the opening, logs the verdict to the transcript, and writes
+the outcome as `voicemail_detected`. `human` and `unknown` verdicts
+proceed normally.
 
 ### Conversation brain
 
