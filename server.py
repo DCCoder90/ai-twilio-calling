@@ -344,7 +344,7 @@ class CallHandler(BaseHTTPRequestHandler):
             self._handle_relay(parsed)
             return
         if parsed.path == "/twilio/voice":
-            self._handle_voice(parsed)
+            self._handle_voice(parsed, None)
             return
         if parsed.path.startswith("/transcripts/"):
             self._handle_transcript_fetch(parsed)
@@ -364,18 +364,37 @@ class CallHandler(BaseHTTPRequestHandler):
             self._send(403, "invalid Twilio signature", "text/plain; charset=utf-8")
             return
         if parsed.path == "/twilio/voice":
-            self._handle_voice(parsed)
+            self._handle_voice(parsed, form)
         elif parsed.path == "/twilio/gather":
             self._handle_gather(parsed, form)
         else:
             self._handle_status(parsed, form)
 
     # --- handlers -----------------------------------------------------
-    def _handle_voice(self, parsed):
+    def _handle_voice(self, parsed, form=None):
         call_id = self._call_id(parsed)
         brief, error = self._load_brief_or_error(call_id)
         if brief is None:
             self._send(200, error)
+            return
+        # Voicemail detection (answering-machine detection runs on the
+        # Twilio side; with synchronous AMD the verdict arrives as
+        # AnsweredBy in this webhook and nothing has been spoken yet).
+        # Ernest's standing rule is that calls never leave voicemail,
+        # so a machine or fax verdict hangs up before the opening.
+        answered_by = ((form or {}).get("AnsweredBy") or "").strip().lower()
+        if answered_by.startswith("machine") or answered_by == "fax":
+            transcripts.append_turn(
+                call_id, "party",
+                f"answered_by: {answered_by} — hung up without speaking "
+                "(voicemail detection)",
+                "status", transcripts_dir=self.server.transcripts_dir,
+            )
+            transcripts.write_outcome(
+                call_id, brief, "voicemail_detected",
+                transcripts_dir=self.server.transcripts_dir,
+            )
+            self._send(200, twiml_document("<Hangup/>"))
             return
         transcripts.append_turn(
             call_id, "muse", brief["opening"], "opening",
