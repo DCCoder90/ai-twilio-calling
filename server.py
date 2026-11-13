@@ -88,6 +88,37 @@ def continue_twiml(call_id, brief, parts):
     return twiml_document(body)
 
 
+# --- inbound message line ----------------------------------------------
+# The agent number takes messages from whoever dials it. The greeting
+# identifies nothing (no names, no household), one speech Gather
+# records the message, and the transcript lands like any other call's
+# so the delivery sweep can find it. Guardrails mirror outbound:
+# reveal nothing, confirm nothing about whose number it is.
+INBOUND_GREETING = (
+    "Hello. You've reached an automated message service. No one is "
+    "available to take your call, but you can leave a message and it "
+    "will be passed along. Please speak your message now."
+)
+INBOUND_THANKS = (
+    "Thank you. Your message has been recorded and will be passed "
+    "along. Goodbye."
+)
+INBOUND_NO_MESSAGE = (
+    "I did not catch a message, so I will let you go. Goodbye."
+)
+
+
+def say_voiced(text):
+    """A <Say> in the relay voice (Say-format name) for the inbound
+    greeting lines, so the message line does not sound robotic."""
+    return f'<Say voice="Polly.Joanna-Generative">{escape(text)}</Say>'
+
+
+def inbound_call_id(form):
+    sid = (form.get("CallSid") or "unknown").strip()
+    return ("inbound-" + sid)[:64]
+
+
 def end_twiml(parts):
     return twiml_document("".join(say(p) for p in parts) + "<Hangup/>")
 
@@ -314,6 +345,16 @@ class CallHandler(BaseHTTPRequestHandler):
             return
         self._send_json(200, {"call_id": call_id, "stored": True})
 
+    def _handle_transcript_index(self):
+        """GET /transcripts — the call_id index (ingest auth). The
+        inbound delivery sweep enumerates new message transcripts
+        from this; per-call records stay on the fetch route."""
+        if not self._check_ingest_auth():
+            return
+        tdir = self.server.transcripts_dir
+        ids = sorted(p.stem for p in tdir.glob("*.jsonl")) if tdir.exists() else []
+        self._send_json(200, {"call_ids": ids})
+
     def _handle_transcript_fetch(self, parsed):
         if not self._check_ingest_auth():
             return
@@ -346,6 +387,9 @@ class CallHandler(BaseHTTPRequestHandler):
         if parsed.path == "/twilio/voice":
             self._handle_voice(parsed, None)
             return
+        if parsed.path == "/transcripts":
+            self._handle_transcript_index()
+            return
         if parsed.path.startswith("/transcripts/"):
             self._handle_transcript_fetch(parsed)
             return
@@ -356,7 +400,8 @@ class CallHandler(BaseHTTPRequestHandler):
         if parsed.path == "/briefs":
             self._handle_ingest()
             return
-        if parsed.path not in ("/twilio/voice", "/twilio/gather", "/twilio/status"):
+        if parsed.path not in ("/twilio/voice", "/twilio/gather", "/twilio/status",
+                               "/twilio/inbound", "/twilio/inbound-message"):
             self._send(404, "not found", "text/plain; charset=utf-8")
             return
         form = self._form()
@@ -367,6 +412,10 @@ class CallHandler(BaseHTTPRequestHandler):
             self._handle_voice(parsed, form)
         elif parsed.path == "/twilio/gather":
             self._handle_gather(parsed, form)
+        elif parsed.path == "/twilio/inbound":
+            self._handle_inbound(parsed, form)
+        elif parsed.path == "/twilio/inbound-message":
+            self._handle_inbound_message(parsed, form)
         else:
             self._handle_status(parsed, form)
 
@@ -406,6 +455,56 @@ class CallHandler(BaseHTTPRequestHandler):
             return
         body = say(brief["opening"]) + gather(call_id, brief["listen_prompt"])
         self._send(200, twiml_document(body))
+
+    def _handle_inbound(self, parsed, form):
+        """Answer a call to the agent number: generic greeting that
+        identifies nothing, then one speech Gather for the message.
+        The TwiML after </Gather> covers the caller who says nothing
+        at all (Gather falls through on empty input)."""
+        call_id = inbound_call_id(form)
+        caller = (form.get("From") or "").strip()
+        tdir = self.server.transcripts_dir
+        transcripts.append_turn(
+            call_id, "party",
+            f"inbound call from {caller or 'an unknown number'}",
+            "status", transcripts_dir=tdir,
+        )
+        transcripts.append_turn(
+            call_id, "muse", INBOUND_GREETING, "opening",
+            transcripts_dir=tdir,
+        )
+        action = escape(f"/twilio/inbound-message?call_id={call_id}",
+                        {'"': "&quot;"})
+        body = (
+            say_voiced(INBOUND_GREETING)
+            + f'<Gather input="speech" action="{action}" method="POST" '
+              'speechTimeout="auto" timeout="10"></Gather>'
+            + say_voiced(INBOUND_NO_MESSAGE)
+            + "<Hangup/>"
+        )
+        self._send(200, twiml_document(body))
+
+    def _handle_inbound_message(self, parsed, form):
+        """The inbound Gather's action: record the message, thank the
+        caller, hang up. An empty result still closes the record so
+        the delivery sweep can report a message-less call."""
+        call_id = self._call_id(parsed)
+        tdir = self.server.transcripts_dir
+        speech = (form.get("SpeechResult") or "").strip()
+        record = {"to": (form.get("From") or "").strip(),
+                  "purpose": "Inbound message left on the agent number"}
+        if speech:
+            transcripts.append_turn(
+                call_id, "party", speech, "speech", transcripts_dir=tdir)
+            transcripts.write_outcome(
+                call_id, record, "inbound_message", transcripts_dir=tdir)
+            self._send(200, twiml_document(
+                say_voiced(INBOUND_THANKS) + "<Hangup/>"))
+        else:
+            transcripts.write_outcome(
+                call_id, record, "inbound_no_message", transcripts_dir=tdir)
+            self._send(200, twiml_document(
+                say_voiced(INBOUND_NO_MESSAGE) + "<Hangup/>"))
 
     def _handle_relay(self, parsed):
         """ConversationRelay WebSocket endpoint. Validates the upgrade
