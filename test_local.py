@@ -149,6 +149,35 @@ def main():
               "<Gather" in body and 'input="speech"' in body and "speechTimeout=" in body)
         check("voice webhook does not hang up", "<Hangup" not in body)
 
+        # (1b) Voicemail detection: a machine verdict hangs up before
+        #      the opening is spoken and records voicemail_detected;
+        #      a human verdict proceeds normally.
+        call_amd = brief_store.create_brief(SAMPLE_BRIEF, call_id="test-amd-machine",
+                                            briefs_dir=briefs_dir)
+        status, body = post(f"/twilio/voice?call_id={call_amd}",
+                            {"AnsweredBy": "machine_start"})
+        check("AMD machine verdict hangs up", "<Hangup/>" in body)
+        check("AMD machine verdict never speaks the opening",
+              SAMPLE_BRIEF["opening"] not in body)
+        amd_outcome_file = transcripts_dir / f"{call_amd}.outcome.json"
+        check("AMD machine verdict writes an outcome", amd_outcome_file.exists())
+        if amd_outcome_file.exists():
+            amd_outcome = json.loads(amd_outcome_file.read_text())
+            check("AMD outcome reason is 'voicemail_detected'",
+                  amd_outcome.get("reason") == "voicemail_detected",
+                  detail=f"outcome={amd_outcome}")
+        amd_turns = [json.loads(line) for line in
+                     (transcripts_dir / f"{call_amd}.jsonl").read_text().splitlines() if line.strip()]
+        check("AMD transcript has no opening turn (nothing was spoken)",
+              all(t.get("kind") != "opening" for t in amd_turns),
+              detail=f"kinds={[t.get('kind') for t in amd_turns]}")
+        call_amd_human = brief_store.create_brief(SAMPLE_BRIEF, call_id="test-amd-human",
+                                                  briefs_dir=briefs_dir)
+        status, body = post(f"/twilio/voice?call_id={call_amd_human}",
+                            {"AnsweredBy": "human"})
+        check("AMD human verdict proceeds with the opening",
+              SAMPLE_BRIEF["opening"] in body and "<Gather" in body)
+
         # (2) A factual question returns the brief's answer, call continues.
         status, body = post(f"/twilio/gather?call_id={call_main}",
                             {"SpeechResult": "Do you have parking available?"})
