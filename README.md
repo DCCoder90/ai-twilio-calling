@@ -136,6 +136,20 @@ up before the opening, logs the verdict to the transcript, and writes
 the outcome as `voicemail_detected`. `human` and `unknown` verdicts
 proceed normally.
 
+### Inbound message line
+
+Point the Twilio number's voice webhook at `POST /twilio/inbound`
+and the agent number becomes a message box. The greeting identifies
+nothing ("You've reached an automated message service…"), one speech
+Gather records the caller's message, and the call is stored as a
+normal transcript under `inbound-<CallSid>` with outcome
+`inbound_message` (or `inbound_no_message` when the caller says
+nothing). Nothing about the number's owner is revealed or confirmed,
+and the line never converses — it only takes the message. Delivery to
+the operator is a periodic sweep over the `GET /transcripts` index:
+new `inbound-*` records are reported in chat and marked seen, with
+quiet hours honored.
+
 ### Conversation brain
 
 Chosen by environment at startup; the startup log line says which is
@@ -227,9 +241,12 @@ needs nothing.
 | `POST /twilio/voice?call_id=<id>` | Twilio | Twilio signature | Opening line + first Gather. |
 | `POST /twilio/gather?call_id=<id>` | Twilio | Twilio signature | One conversation turn per POST (`SpeechResult` form field). |
 | `POST /twilio/status?call_id=<id>` | Twilio | Twilio signature | Status callbacks; logged to the transcript; ends the call record as `party_hangup` when nothing else did. |
+| `POST /twilio/inbound` | Twilio | Twilio signature | A call to the agent number: generic message-service greeting + one speech Gather. |
+| `POST /twilio/inbound-message?call_id=<id>` | Twilio | Twilio signature | The inbound Gather's action: records the message, outcome `inbound_message` (or `inbound_no_message`). |
 | `GET /twilio/relay` | Twilio | Twilio signature on the WebSocket upgrade | ConversationRelay session (only when `VOICE_MODE=relay`); JSON messages per Twilio's relay protocol. |
 | `POST /briefs` | operator | `X-Ingest-Secret` | Body `{"call_id": "...", "brief": {...}}`. Validates the brief and stores it atomically. 400 invalid, 401 bad secret, 409 spent call_id, 503 when ingest is not configured. |
 | `GET /transcripts/<call_id>` | operator | `X-Ingest-Secret` | `{call_id, turns: [...], outcome: {...}|null}`. 404 when the call is unknown. |
+| `GET /transcripts` | operator | `X-Ingest-Secret` | `{call_ids: [...]}` — every transcript on the service; the inbound delivery sweep enumerates from this. |
 
 Authentication model:
 
