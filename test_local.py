@@ -178,6 +178,46 @@ def main():
         check("AMD human verdict proceeds with the opening",
               SAMPLE_BRIEF["opening"] in body and "<Gather" in body)
 
+        # (1c) Inbound message line: the agent number answers with a
+        #      generic greeting that identifies nothing, records one
+        #      message, and closes the record for the delivery sweep.
+        status, body = post("/twilio/inbound",
+                            {"CallSid": "CAinbound0001", "From": "+15551234567",
+                             "To": SAMPLE_BRIEF["from_number"]})
+        check("inbound route answers 200", status == 200)
+        check("inbound greeting is the generic message-service greeting",
+              "automated message service" in body)
+        check("inbound greeting identifies nothing (no names)",
+              "Ernest" not in body and "Muse" not in body)
+        check("inbound greeting opens a speech Gather for the message",
+              "<Gather" in body and "inbound-message?call_id=inbound-CAinbound0001" in body)
+        status, body = post("/twilio/inbound-message?call_id=inbound-CAinbound0001",
+                            {"SpeechResult": "Hi, this is Dana from the venue, calling about Saturday.",
+                             "From": "+15551234567"})
+        check("inbound message is thanked and hung up",
+              "recorded" in body and "<Hangup/>" in body)
+        inb_outcome_file = transcripts_dir / "inbound-CAinbound0001.outcome.json"
+        check("inbound message writes an outcome", inb_outcome_file.exists())
+        if inb_outcome_file.exists():
+            inb_outcome = json.loads(inb_outcome_file.read_text())
+            check("inbound outcome reason is 'inbound_message'",
+                  inb_outcome.get("reason") == "inbound_message",
+                  detail=f"outcome={inb_outcome}")
+        inb_turns = [json.loads(line) for line in
+                     (transcripts_dir / "inbound-CAinbound0001.jsonl").read_text().splitlines()
+                     if line.strip()]
+        check("inbound transcript records the caller's message",
+              any(t.get("kind") == "speech" and "Dana from the venue" in t.get("text", "")
+                  for t in inb_turns),
+              detail=f"turns={[(t.get('speaker'), t.get('kind')) for t in inb_turns]}")
+        post("/twilio/inbound", {"CallSid": "CAinbound0002", "From": "+15557654321"})
+        status, body = post("/twilio/inbound-message?call_id=inbound-CAinbound0002",
+                            {"From": "+15557654321"})
+        inb2_outcome_file = transcripts_dir / "inbound-CAinbound0002.outcome.json"
+        check("inbound silence still closes the record as 'inbound_no_message'",
+              inb2_outcome_file.exists()
+              and json.loads(inb2_outcome_file.read_text()).get("reason") == "inbound_no_message")
+
         # (2) A factual question returns the brief's answer, call continues.
         status, body = post(f"/twilio/gather?call_id={call_main}",
                             {"SpeechResult": "Do you have parking available?"})
@@ -568,6 +608,13 @@ def main():
         code, _ = raw("POST", base4, "/briefs",
                       {"call_id": "ingest-1", "brief": SAMPLE_BRIEF}, good)
         check("re-ingesting a spent call_id is refused (409)", code == 409)
+        code, _ = raw("GET", base4, "/transcripts")
+        check("transcript index without the secret is refused (401)", code == 401)
+        code, ibody = raw("GET", base4, "/transcripts", None, good)
+        idata = json.loads(ibody) if code == 200 else {}
+        check("transcript index with the secret lists known call_ids",
+              code == 200 and "ingest-1" in idata.get("call_ids", []),
+              detail=f"code={code} ids={idata.get('call_ids')}")
     finally:
         proc4.terminate()
         try:
